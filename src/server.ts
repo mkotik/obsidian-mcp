@@ -2,9 +2,11 @@ import { createServer } from 'node:http';
 import { readFile, writeFile, appendFile, mkdir, stat } from 'node:fs/promises';
 import * as path from 'node:path';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
-import { toNodeHandler, localhostHostValidation, localhostOriginValidation } from '@modelcontextprotocol/node';
+import { toNodeHandler, hostHeaderValidation, originValidation } from '@modelcontextprotocol/node';
 import * as z from 'zod';
 import { Vault, VaultPathError } from './vault.js';
+import { createAccessVerifier, AccessConfigError } from './access.js';
+import type { AccessVerifier } from './access.js';
 
 const SERVER_NAME = 'obsidian-vault';
 const SERVER_VERSION = '1.0.0';
@@ -13,6 +15,14 @@ const VAULT_ROOT = process.env.VAULT_ROOT ?? '/home/ubuntu/vaults/main';
 const BIND_HOST = process.env.MCP_HOST ?? '127.0.0.1';
 const BIND_PORT = Number(process.env.MCP_PORT ?? 3000);
 const MCP_PATH = '/mcp';
+
+/**
+ * Public hostname this server is published under by Cloudflare Tunnel. Tunnel
+ * traffic arrives with that Host header, so it has to be on the allowlist
+ * alongside loopback; the allowlist is what keeps DNS-rebinding protection
+ * meaningful instead of accepting any Host.
+ */
+const PUBLIC_HOSTNAME = process.env.MCP_PUBLIC_HOSTNAME?.trim();
 
 // ---------------------------------------------------------------------------
 // Resource limits. These exist so a malformed or hostile request cannot make
@@ -322,22 +332,88 @@ function buildServer(): McpServer {
 // ---------------------------------------------------------------------------
 const handler = createMcpHandler(() => buildServer());
 const nodeHandler = toNodeHandler(handler);
-const validateHost = localhostHostValidation();
-const validateOrigin = localhostOriginValidation();
 
-const http = createServer((req, res) => {
-  // DNS-rebinding / cross-origin guards run before the MCP handler sees anything.
+// Allowlist entries are hostnames only; the SDK strips the port from the Host
+// header before comparing, and rejects an entry that carries one.
+const allowedHostnames = ['127.0.0.1', 'localhost', ...(PUBLIC_HOSTNAME ? [PUBLIC_HOSTNAME] : [])];
+const validateHost = hostHeaderValidation(allowedHostnames);
+const validateOrigin = originValidation(allowedHostnames);
+
+/**
+ * Cloudflare Access verifier. Constructed at startup and intentionally NOT
+ * optional: if CF_ACCESS_TEAM_DOMAIN / CF_ACCESS_AUD are missing or malformed
+ * the process exits instead of serving the vault unauthenticated.
+ */
+function buildAccessVerifier(): AccessVerifier {
+  try {
+    return createAccessVerifier({
+      teamDomain: process.env.CF_ACCESS_TEAM_DOMAIN,
+      aud: process.env.CF_ACCESS_AUD,
+    });
+  } catch (err) {
+    if (err instanceof AccessConfigError) {
+      log('fatal', { error: 'access configuration invalid', detail: err.message });
+      process.exit(78); // EX_CONFIG
+    }
+    throw err;
+  }
+}
+
+const accessVerifier = buildAccessVerifier();
+
+/** 401 with a standards-shaped Bearer challenge and a JSON-RPC error body. */
+function rejectUnauthenticated(res: import('node:http').ServerResponse, reason: string): void {
+  res.statusCode = 401;
+  res.setHeader('www-authenticate', `Bearer realm="${SERVER_NAME}", error="invalid_token"`);
+  res.setHeader('content-type', 'application/json');
+  res.end(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      error: { code: -32001, message: 'unauthorized' },
+      id: null,
+    })
+  );
+  // Permitted log vocabulary only. No token, no claims, no identity.
+  log(`Authentication rejected: ${reason}`);
+}
+
+async function handleRequest(
+  req: import('node:http').IncomingMessage,
+  res: import('node:http').ServerResponse
+): Promise<void> {
+  // DNS-rebinding / cross-origin guards run before anything else.
   if (!validateHost(req, res) || !validateOrigin(req, res)) return;
 
   const url = req.url ?? '';
-  if (url === MCP_PATH || url.startsWith(`${MCP_PATH}?`)) {
-    void nodeHandler(req, res);
+  if (!(url === MCP_PATH || url.startsWith(`${MCP_PATH}?`))) {
+    res.statusCode = 404;
+    res.setHeader('content-type', 'text/plain');
+    res.end('not found\n');
     return;
   }
 
-  res.statusCode = 404;
-  res.setHeader('content-type', 'text/plain');
-  res.end('not found\n');
+  // Every /mcp request must carry a valid Cloudflare Access assertion. There is
+  // no localhost exemption by design.
+  const auth = await accessVerifier.verify(req);
+  if (!auth.ok) {
+    rejectUnauthenticated(res, auth.reason);
+    return;
+  }
+  log('Authentication succeeded');
+
+  await nodeHandler(req, res);
+}
+
+const http = createServer((req, res) => {
+  void handleRequest(req, res).catch(() => {
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.setHeader('content-type', 'text/plain');
+      res.end('internal error\n');
+    } else {
+      res.end();
+    }
+  });
 });
 
 http.listen(BIND_PORT, BIND_HOST, () => {
@@ -349,6 +425,11 @@ http.listen(BIND_PORT, BIND_HOST, () => {
     port: BIND_PORT,
     endpoint: `http://${BIND_HOST}:${BIND_PORT}${MCP_PATH}`,
     tools: 'list_notes,read_note,search_notes,write_note,append_note',
+    allowed_hostnames: allowedHostnames.join(','),
+    auth: 'cloudflare-access-jwt',
+    auth_issuer: accessVerifier.issuer,
+    auth_jwks: accessVerifier.jwksUrl,
+    auth_audience_configured: true,
   });
 });
 
