@@ -1,14 +1,15 @@
 {
   "name": "obsidian-mcp",
   "version": "1.0.0",
-  "description": "Local-only MCP server exposing safe read/write access to an Obsidian vault synced by obsidian-headless",
+  "description": "MCP server exposing safe read/write access to an Obsidian vault, protected by Cloudflare Access",
   "type": "module",
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "verify": "node test/mcp-verify.mjs",
-    "postcheck": "node test/postcheck.mjs"
+    "postcheck": "node test/postcheck.mjs",
+    "access-verify": "node test/access-verify.mjs"
   },
   "keywords": [
     "mcp",
@@ -24,6 +25,7 @@
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "hono": "^4.13.5",
+    "jose": "^6.2.10",
     "zod": "^4.4.3"
   },
   "devDependencies": {
