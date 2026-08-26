@@ -1,0 +1,36 @@
+[Unit]
+Description=Obsidian vault MCP server (loopback only)
+Documentation=https://ts.sdk.modelcontextprotocol.io/v2/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/obsidian-mcp
+Environment=NODE_ENV=production
+Environment=VAULT_ROOT=/home/ubuntu/vaults/main
+Environment=MCP_HOST=127.0.0.1
+Environment=MCP_PORT=3000
+ExecStart=/usr/bin/node /home/ubuntu/obsidian-mcp/dist/server.js
+Restart=on-failure
+RestartSec=5
+
+# --- hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/vaults/main
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
