@@ -5,6 +5,7 @@ import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import { toNodeHandler, hostHeaderValidation, originValidation } from '@modelcontextprotocol/node';
 import * as z from 'zod';
 import { Vault, VaultPathError, TRASH_DIR, isSamePathOrInside } from './vault.js';
+import { LinkIndex, rewriteLinks, findLinksTo } from './links.js';
 import { createAccessVerifier, AccessConfigError } from './access.js';
 import type { AccessVerifier } from './access.js';
 
@@ -41,6 +42,10 @@ const LIMITS = {
   snippetsPerNote: 3,
   walkDepth: 24,
   walkFiles: 20000,
+  patchChars: 256 * 1024, // largest single patch anchor / replacement
+  backlinksMax: 200,
+  linkScanFiles: 5000,
+  linkRewriteFiles: 2000,
 } as const;
 
 const vault = await Vault.open(VAULT_ROOT);
@@ -85,6 +90,30 @@ async function guard(tool: string, body: () => Promise<ToolResult>): Promise<Too
     if (code === 'EACCES' || code === 'EPERM') return fail('permission denied');
     log('tool.error', { tool, code: code ?? 'unknown' });
     return fail('internal error handling request');
+  }
+}
+
+/**
+ * Every file in the vault, vault-relative, for wikilink resolution. Includes
+ * non-markdown files because embeds such as `![[image.png]]` target them.
+ */
+async function allVaultFiles(): Promise<string[]> {
+  const { files } = await vault.walkMarkdown(vault.root, {
+    maxFiles: LIMITS.walkFiles,
+    maxDepth: LIMITS.walkDepth,
+    allFiles: true,
+  });
+  return files;
+}
+
+/** Read a note as UTF-8, returning null when it is not readable as text. */
+async function readNoteText(abs: string): Promise<string | null> {
+  try {
+    const st = await stat(abs);
+    if (!st.isFile() || st.size > LIMITS.searchFileBytes) return null;
+    return await readFile(abs, 'utf8');
+  } catch {
+    return null;
   }
 }
 
@@ -389,7 +418,7 @@ function buildServer(): McpServer {
     'move_note',
     {
       description:
-        'Move or rename a note or a folder inside the vault. Works for a single .md note or an entire directory (including any attachments it contains), so the vault can be reorganised. Parent directories of the destination are created as needed. Fails if the destination already exists unless overwrite=true (files only).',
+        'Move or rename a note or a folder inside the vault. Works for a single .md note or an entire directory (including any attachments it contains), so the vault can be reorganised. Wikilinks pointing at anything that moved are rewritten by default, and the response lists every note that was edited. Parent directories of the destination are created as needed. Fails if the destination already exists unless overwrite=true (files only).',
       inputSchema: z.object({
         from: z.string().max(1024).describe('Existing vault-relative .md note path, or a directory path.'),
         to: z
@@ -400,9 +429,13 @@ function buildServer(): McpServer {
           .boolean()
           .optional()
           .describe('Replace the destination note if it already exists. Ignored for directories, which never overwrite. Defaults to false.'),
+        update_links: z
+          .boolean()
+          .optional()
+          .describe('Rewrite [[wikilinks]] elsewhere in the vault so they still point at the moved file(s). Defaults to true.'),
       }),
     },
-    async ({ from, to, overwrite }) =>
+    async ({ from, to, overwrite, update_links }) =>
       guard('move_note', async () => {
         const source = await vault.resolve(from, { mustExist: true });
         const sourceStat = await stat(source.abs);
@@ -440,21 +473,219 @@ function buildServer(): McpServer {
           if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
         }
 
+        const rewriting = update_links !== false;
+
+        // Snapshot the pre-move file list so links can be resolved against the
+        // vault as it was, then map every file that is about to move.
+        const filesBefore = rewriting ? await allVaultFiles() : [];
+        const moved = new Map<string, string>();
+        if (rewriting) {
+          if (isDirectory) {
+            const prefix = `${source.rel}/`;
+            for (const f of filesBefore) {
+              if (f.startsWith(prefix)) moved.set(f, `${target.rel}/${f.slice(prefix.length)}`);
+            }
+          } else {
+            moved.set(source.rel, target.rel);
+          }
+        }
+
         await mkdir(path.dirname(target.abs), { recursive: true });
         await rename(source.abs, target.abs);
 
+        // Link rewriting happens after the move so the "after" index reflects
+        // reality. A failure here cannot corrupt a note: each file is rewritten
+        // only when its own edit set is non-empty, and each write is whole-file
+        // from text we just read.
+        const linkEdits: Array<{ path: string; edits: unknown[] }> = [];
+        let linksTruncated = false;
+
+        if (rewriting && moved.size > 0) {
+          const indexBefore = new LinkIndex(filesBefore);
+          const filesAfter = await allVaultFiles();
+          const indexAfter = new LinkIndex(filesAfter);
+
+          const movedTargets = new Set(moved.values());
+          let scanned = 0;
+
+          for (const note of filesAfter) {
+            if (!/\.md$/i.test(note)) continue;
+            if (movedTargets.has(note)) continue; // links inside a moved note keep resolving
+            if (scanned >= LIMITS.linkRewriteFiles) {
+              linksTruncated = true;
+              break;
+            }
+            scanned += 1;
+
+            const abs = path.join(vault.root, note);
+            const text = await readNoteText(abs);
+            if (text === null || !text.includes('[[')) continue;
+
+            const { text: updated, edits } = rewriteLinks(text, moved, indexBefore, indexAfter);
+            if (edits.length === 0) continue;
+
+            await writeFile(abs, updated, 'utf8');
+            linkEdits.push({ path: note, edits });
+          }
+        }
+
+        const linksChanged = linkEdits.reduce((n, f) => n + f.edits.length, 0);
         log('move_note', {
           from: source.rel,
           to: target.rel,
           kind: isDirectory ? 'directory' : 'file',
           overwritten: destExisted,
+          files_moved: moved.size,
+          notes_relinked: linkEdits.length,
+          links_rewritten: linksChanged,
         });
         return ok({
           from: source.rel,
           to: target.rel,
           kind: isDirectory ? 'directory' : 'file',
           overwritten: destExisted,
+          files_moved: isDirectory ? moved.size : 1,
+          links_updated: {
+            enabled: rewriting,
+            notes_edited: linkEdits.length,
+            links_rewritten: linksChanged,
+            truncated: linksTruncated,
+            details: linkEdits,
+          },
         });
+      })
+  );
+
+  server.registerTool(
+    'patch_note',
+    {
+      description:
+        'Replace an exact snippet of text inside an existing note, leaving the rest of the file untouched. Prefer this over write_note for editing an existing note: write_note replaces the whole file, so a partial rewrite can silently drop content. The anchor must match exactly; if it is missing or appears a different number of times than expected, nothing is written and the tool reports what it found.',
+      inputSchema: z.object({
+        path: z.string().max(1024).describe('Vault-relative .md note path. Must already exist.'),
+        old_text: z
+          .string()
+          .min(1)
+          .max(LIMITS.patchChars)
+          .describe('Exact text to find, including whitespace and newlines. Must be unique unless expected_matches says otherwise.'),
+        new_text: z
+          .string()
+          .max(LIMITS.patchChars)
+          .describe('Replacement text. Pass an empty string to delete the matched text.'),
+        expected_matches: z
+          .number()
+          .int()
+          .min(1)
+          .max(1000)
+          .optional()
+          .describe('How many occurrences of old_text are expected. Defaults to 1. The patch is refused unless the count matches exactly.'),
+      }),
+    },
+    async ({ path: rel, old_text, new_text, expected_matches }) =>
+      guard('patch_note', async () => {
+        const target = await vault.resolve(rel, { requireMarkdown: true, mustExist: true });
+
+        const st = await stat(target.abs);
+        if (!st.isFile()) return fail('path refers to a directory, not a note');
+        if (st.size > LIMITS.readBytes) return fail('note is too large to patch');
+
+        const before = await readFile(target.abs, 'utf8');
+
+        // Count occurrences without regex, so the anchor is always literal.
+        let count = 0;
+        let at = before.indexOf(old_text);
+        while (at !== -1) {
+          count += 1;
+          at = before.indexOf(old_text, at + old_text.length);
+          if (count > 1000) break;
+        }
+
+        const expected = expected_matches ?? 1;
+        if (count === 0) {
+          log('patch_note.rejected', { path: target.rel, reason: 'anchor_not_found' });
+          return fail('old_text was not found in the note; nothing was changed');
+        }
+        if (count !== expected) {
+          log('patch_note.rejected', { path: target.rel, reason: 'match_count', found: count, expected });
+          return fail(
+            `old_text appears ${count} time(s) but expected_matches is ${expected}; nothing was changed. ` +
+              'Include more surrounding text to make the anchor unique, or set expected_matches to the real count.'
+          );
+        }
+
+        const after = before.split(old_text).join(new_text);
+        if (after.length > LIMITS.writeChars) return fail('resulting note would exceed the size limit');
+
+        await writeFile(target.abs, after, 'utf8');
+
+        log('patch_note', {
+          path: target.rel,
+          replacements: count,
+          bytes_before: Buffer.byteLength(before),
+          bytes_after: Buffer.byteLength(after),
+        });
+        return ok({
+          path: target.rel,
+          replacements: count,
+          bytes_before: Buffer.byteLength(before),
+          bytes_after: Buffer.byteLength(after),
+        });
+      })
+  );
+
+  server.registerTool(
+    'get_backlinks',
+    {
+      description:
+        'List notes that link to the given note via an Obsidian wikilink ([[Note]] or an embed). Resolves both bare-name and path-form links, so it finds references search_notes would miss. Returns each referring note with the matching line numbers and link text.',
+      inputSchema: z.object({
+        path: z.string().max(1024).describe('Vault-relative .md note path to find references to.'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(LIMITS.backlinksMax)
+          .optional()
+          .describe(`Maximum referring notes to return (default ${LIMITS.searchDefault}).`),
+      }),
+    },
+    async ({ path: rel, limit }) =>
+      guard('get_backlinks', async () => {
+        const target = await vault.resolve(rel, { requireMarkdown: true, mustExist: true });
+        const cap = limit ?? LIMITS.searchDefault;
+
+        const files = await allVaultFiles();
+        const index = new LinkIndex(files);
+
+        const notes = files.filter((f) => /\.md$/i.test(f));
+        const results: Array<{ path: string; references: number; matches: unknown[] }> = [];
+        let scanned = 0;
+        let truncated = false;
+
+        for (const note of notes) {
+          if (note === target.rel) continue; // self-links are not backlinks
+          if (scanned >= LIMITS.linkScanFiles) {
+            truncated = true;
+            break;
+          }
+          scanned += 1;
+
+          const text = await readNoteText(path.join(vault.root, note));
+          if (text === null || !text.includes('[[')) continue;
+
+          const hits = findLinksTo(text, target.rel, index);
+          if (hits.length === 0) continue;
+
+          if (results.length >= cap) {
+            truncated = true;
+            break;
+          }
+          results.push({ path: note, references: hits.length, matches: hits });
+        }
+
+        const total = results.reduce((n, r) => n + r.references, 0);
+        log('get_backlinks', { path: target.rel, notes: results.length, references: total, scanned });
+        return ok({ path: target.rel, referring_notes: results.length, total_references: total, truncated, results });
       })
   );
 
@@ -558,7 +789,7 @@ http.listen(BIND_PORT, BIND_HOST, () => {
     bind_address: BIND_HOST,
     port: BIND_PORT,
     endpoint: `http://${BIND_HOST}:${BIND_PORT}${MCP_PATH}`,
-    tools: 'list_notes,read_note,search_notes,write_note,append_note,delete_note,move_note',
+    tools: 'list_notes,read_note,search_notes,write_note,append_note,patch_note,delete_note,move_note,get_backlinks',
     allowed_hostnames: allowedHostnames.join(','),
     auth: 'cloudflare-access-jwt',
     auth_issuer: accessVerifier.issuer,
