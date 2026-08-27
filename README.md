@@ -24,12 +24,12 @@ to Cloudflare; nothing dials in. The only open inbound port on the host is SSH.
 Two decisions shape the whole implementation:
 
 1. **Loopback only.** The server binds explicitly to `127.0.0.1`, never `0.0.0.0`. Public reachability is provided entirely by Cloudflare Tunnel, which makes an *outbound* connection — so the host never opens an inbound port, and the origin is unreachable over its public IP.
-2. **The vault is the only reachable filesystem.** Every client-supplied path is untrusted input. There is no shell tool, no delete, no rename, and no general filesystem access — because a note-writing agent does not need them, and their absence removes whole categories of failure.
+2. **The vault is the only reachable filesystem.** Every client-supplied path is untrusted input. There is no shell tool and no general filesystem access — because a note-editing agent does not need them, and their absence removes whole categories of failure. The tools that *do* mutate the vault (write, append, delete, move) are each confined to the same path sandbox, and deletes are recoverable by default.
 3. **No unauthenticated request reaches a tool — including from localhost.** The process refuses to start without Cloudflare Access configuration, and validates the Access JWT on every `/mcp` request. There is deliberately no loopback bypass: anything that can reach port 3000 (another local process, a future misconfigured proxy, a compromised dependency) still has to present a valid, Cloudflare-signed assertion.
 
 ## Tools
 
-Five tools, no more:
+Seven tools, no more:
 
 | Tool | Input | Behavior |
 |---|---|---|
@@ -38,8 +38,15 @@ Five tools, no more:
 | `search_notes` | `query`, `limit?` | Case-insensitive literal text search, returns paths + snippets |
 | `write_note` | `path`, `content` | Creates or overwrites a `.md` note, creating parent dirs |
 | `append_note` | `path`, `content`, `create_if_missing?` | Appends UTF-8 text to a `.md` note |
+| `delete_note` | `path`, `permanent?` | Moves a `.md` note to `.trash/` (recoverable); `permanent: true` erases it |
+| `move_note` | `from`, `to`, `overwrite?` | Renames or moves a note **or a whole folder**, creating destination parents |
 
-Deliberately **not** exposed: delete, rename, shell/command execution, arbitrary filesystem reads, package installation, network requests, or direct `ob` CLI invocation.
+Deliberately **not** exposed: shell/command execution, arbitrary filesystem reads, package installation, network requests, or direct `ob` CLI invocation.
+
+`move_note` is what makes the vault reorganisable: it accepts a directory on both
+sides, so `move_note from="raw/journal" to="active/journal"` relocates the folder and
+everything inside it — including non-markdown attachments, which are moved with the
+folder even though they can never be addressed individually.
 
 ## Authentication
 
@@ -103,6 +110,29 @@ Resource limits exist so a malformed or hostile request can't exhaust memory:
 | Directory depth | 24 |
 | Process memory (systemd) | 512 MiB |
 
+### Destructive tools
+
+`delete_note` and `move_note` mutate the vault, and the vault is live-synced, so a
+change propagates to every device within seconds. Three properties keep that safe:
+
+- **Deletes are recoverable by default.** `delete_note` moves the note to
+  `.trash/<timestamp>/<original path>/` rather than unlinking it. The timestamped
+  subdirectory preserves the original path, so same-named notes can't collide and a
+  restore is a plain `move_note` back out. `permanent: true` opts into a real unlink,
+  and deleting something already inside `.trash/` always erases it.
+- **`.trash/` is hidden, not excluded.** It is skipped when walking, so trashed notes
+  never appear in `list_notes` or `search_notes` results, but it remains addressable by
+  explicit path so a note can be inspected and restored. `.obsidian` and `.git`, by
+  contrast, stay hard-excluded everywhere.
+- **Moves refuse to clobber or corrupt.** An existing destination is rejected unless
+  `overwrite: true` (files only — directories never overwrite), and moving a folder into
+  itself or into one of its own descendants is rejected up front rather than failing
+  halfway and orphaning files.
+
+Both tools resolve **every** path they touch — source *and* destination — through the
+same sandbox as the read tools, so traversal, absolute paths, `~`, symlink escapes,
+`.obsidian`/`.git`, and non-markdown targets are refused identically.
+
 Logging records tool name, relative path, and byte counts. **Note contents are never logged**, and neither are credentials or tokens. No secrets appear anywhere in this repository; the server reads only environment variables for configuration.
 
 ## Configuration
@@ -144,9 +174,24 @@ npm start          # serves http://127.0.0.1:3000/mcp
 npm run verify
 ```
 
-It covers the five tools end to end (write a note, read it back, append, read again, confirm it appears in listing and search) and then attacks the sandbox: `../etc/passwd`, `../../etc/passwd`, `/etc/passwd`, `~/secret.md`, `notes/../../etc/passwd`, `.obsidian/app.json`, writes outside the vault, non-markdown writes, and a symlink escape. All must be rejected.
+It covers the read/write tools end to end (write a note, read it back, append, read again, confirm it appears in listing and search) and then attacks the sandbox: `../etc/passwd`, `../../etc/passwd`, `/etc/passwd`, `~/secret.md`, `notes/../../etc/passwd`, `.obsidian/app.json`, writes outside the vault, non-markdown writes, and a symlink escape. All must be rejected.
 
 > **Note:** the suite creates a `_mcp_test/` directory inside the vault and removes it afterwards. If the vault is live-synced, those files will briefly replicate to Obsidian Sync and then be deleted. Point `VAULT_ROOT` at a scratch copy if that matters. In particular the symlink-escape case creates a symlink inside the vault; a running sync client may follow and upload it before the test cleans up, so prefer a scratch vault for that test.
+
+`test/tools-verify.mjs` covers the two destructive tools against a live authenticated
+endpoint, since they cannot be exercised without a valid Cloudflare Access assertion:
+
+```bash
+MCP_URL=https://mcp.example.com/mcp MCP_BEARER=<access-token> npm run tools-verify
+```
+
+It creates its own uniquely-named throwaway subtree, then checks: rename in place, move
+into a not-yet-existing folder, whole-folder relocation, overwrite refusal and explicit
+overwrite, soft delete to `.trash/`, that the trashed note is absent from both listing
+and search, restore back out of `.trash/`, and permanent delete. It then runs 18 sandbox
+attacks against both tools (traversal, absolute, `~`, `.obsidian`, `.git`, non-markdown,
+directory delete, move in/out of the vault, folder-into-itself, clobbering an existing
+folder) and requires every one to be rejected. It removes its subtree on the way out.
 
 ## Deployment
 
@@ -167,6 +212,7 @@ src/access.ts      Cloudflare Access JWT verification (JWKS, issuer, audience, e
 src/server.ts      MCP server, tool definitions, limits, logging, authenticated HTTP mount
 test/mcp-verify.mjs    full MCP client suite (functional + sandbox attacks)
 test/access-verify.mjs authentication suite (missing/malformed/forged/expired/wrong-aud)
+test/tools-verify.mjs  delete/move suite (trash, restore, folder moves, 18 sandbox cases)
 test/postcheck.mjs     short re-check against a running hardened service
 obsidian-mcp.service   systemd unit
 ```

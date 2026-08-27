@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "verify": "node test/mcp-verify.mjs",
     "postcheck": "node test/postcheck.mjs",
-    "access-verify": "node test/access-verify.mjs"
+    "access-verify": "node test/access-verify.mjs",
+    "tools-verify": "node test/tools-verify.mjs"
   },
   "keywords": [
     "mcp",
