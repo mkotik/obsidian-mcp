@@ -54,6 +54,11 @@ export function isSamePathOrInside(parentAbs: string, childAbs: string): boolean
 export interface WalkOptions {
   maxFiles: number;
   maxDepth: number;
+  /**
+   * Include every file rather than only `.md`. Used to build the wikilink index,
+   * since embeds such as `![[image.png]]` target non-markdown files.
+   */
+  allFiles?: boolean;
 }
 
 /**
@@ -202,7 +207,7 @@ export class Vault {
         const child = path.join(dir, entry.name);
         if (entry.isDirectory()) {
           queue.push({ dir: child, depth: depth + 1 });
-        } else if (entry.isFile() && path.extname(entry.name).toLowerCase() === '.md') {
+        } else if (entry.isFile() && (opts.allFiles === true || path.extname(entry.name).toLowerCase() === '.md')) {
           if (files.length >= opts.maxFiles) {
             truncated = true;
             continue;
