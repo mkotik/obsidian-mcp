@@ -1,10 +1,10 @@
 import { createServer } from 'node:http';
-import { readFile, writeFile, appendFile, mkdir, stat } from 'node:fs/promises';
+import { readFile, writeFile, appendFile, mkdir, stat, unlink, rename, copyFile } from 'node:fs/promises';
 import * as path from 'node:path';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import { toNodeHandler, hostHeaderValidation, originValidation } from '@modelcontextprotocol/node';
 import * as z from 'zod';
-import { Vault, VaultPathError } from './vault.js';
+import { Vault, VaultPathError, TRASH_DIR, isSamePathOrInside } from './vault.js';
 import { createAccessVerifier, AccessConfigError } from './access.js';
 import type { AccessVerifier } from './access.js';
 
@@ -324,6 +324,140 @@ function buildServer(): McpServer {
       })
   );
 
+  // -------------------------------------------------------------- delete_note
+  server.registerTool(
+    'delete_note',
+    {
+      description:
+        'Delete a markdown note. By default the note is moved to the vault\'s .trash/ folder (recoverable, and restorable with move_note) rather than erased. Pass permanent=true to erase it irreversibly. Only .md paths inside the vault are allowed.',
+      inputSchema: z.object({
+        path: z.string().max(1024).describe('Vault-relative .md path to delete.'),
+        permanent: z
+          .boolean()
+          .optional()
+          .describe(
+            'Erase the file instead of moving it to .trash/. Irreversible, and the deletion propagates through Obsidian Sync. Defaults to false.'
+          ),
+      }),
+    },
+    async ({ path: notePath, permanent }) =>
+      guard('delete_note', async () => {
+        const target = await vault.resolve(notePath, { requireMarkdown: true, mustExist: true });
+
+        const st = await stat(target.abs);
+        if (!st.isFile()) return fail('path does not refer to a note');
+
+        // Refuse to recurse on the trash folder itself: permanently deleting from
+        // inside .trash is allowed, but soft-deleting a trashed file is a no-op loop.
+        const inTrash = target.rel === TRASH_DIR || target.rel.startsWith(`${TRASH_DIR}/`);
+
+        if (permanent === true || inTrash) {
+          await unlink(target.abs);
+          log('delete_note', { path: target.rel, permanent: true, bytes: st.size });
+          return ok({ path: target.rel, deleted: true, permanent: true, recoverable: false });
+        }
+
+        // Soft delete: .trash/<timestamp>/<original path>, preserving structure so
+        // two notes with the same basename cannot collide and restores are obvious.
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const trashRel = `${TRASH_DIR}/${stamp}/${target.rel}`;
+        const trashTarget = await vault.resolve(trashRel, { requireMarkdown: true });
+
+        await mkdir(path.dirname(trashTarget.abs), { recursive: true });
+        try {
+          await rename(target.abs, trashTarget.abs);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+          await copyFile(target.abs, trashTarget.abs);
+          await unlink(target.abs);
+        }
+
+        log('delete_note', { path: target.rel, permanent: false, bytes: st.size });
+        return ok({
+          path: target.rel,
+          deleted: true,
+          permanent: false,
+          recoverable: true,
+          trash_path: trashTarget.rel,
+          restore_hint: `move_note from="${trashTarget.rel}" to="${target.rel}"`,
+        });
+      })
+  );
+
+  // ---------------------------------------------------------------- move_note
+  server.registerTool(
+    'move_note',
+    {
+      description:
+        'Move or rename a note or a folder inside the vault. Works for a single .md note or an entire directory (including any attachments it contains), so the vault can be reorganised. Parent directories of the destination are created as needed. Fails if the destination already exists unless overwrite=true (files only).',
+      inputSchema: z.object({
+        from: z.string().max(1024).describe('Existing vault-relative .md note path, or a directory path.'),
+        to: z
+          .string()
+          .max(1024)
+          .describe('New vault-relative path. Must end in .md when moving a note; a directory path when moving a folder.'),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe('Replace the destination note if it already exists. Ignored for directories, which never overwrite. Defaults to false.'),
+      }),
+    },
+    async ({ from, to, overwrite }) =>
+      guard('move_note', async () => {
+        const source = await vault.resolve(from, { mustExist: true });
+        const sourceStat = await stat(source.abs);
+        const isDirectory = sourceStat.isDirectory();
+
+        if (!isDirectory && !sourceStat.isFile()) {
+          return fail('source is neither a note nor a folder');
+        }
+        // Files keep the same .md-only rule the write tools enforce.
+        if (!isDirectory && path.extname(source.abs).toLowerCase() !== '.md') {
+          return fail('only .md notes can be moved individually (move the containing folder instead)');
+        }
+
+        const target = await vault.resolve(to, { requireMarkdown: !isDirectory });
+
+        if (target.rel === source.rel) return fail('source and destination are the same path');
+
+        // Moving a folder into itself or into its own descendant would either fail
+        // mid-operation or silently orphan files, so reject it up front.
+        if (isDirectory && isSamePathOrInside(source.abs, target.abs)) {
+          return fail('cannot move a folder into itself or into one of its own subfolders');
+        }
+
+        let destExisted = false;
+        try {
+          const destStat = await stat(target.abs);
+          destExisted = true;
+          if (isDirectory || destStat.isDirectory()) {
+            return fail('destination already exists');
+          }
+          if (overwrite !== true) {
+            return fail('destination already exists (pass overwrite to replace it)');
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        }
+
+        await mkdir(path.dirname(target.abs), { recursive: true });
+        await rename(source.abs, target.abs);
+
+        log('move_note', {
+          from: source.rel,
+          to: target.rel,
+          kind: isDirectory ? 'directory' : 'file',
+          overwritten: destExisted,
+        });
+        return ok({
+          from: source.rel,
+          to: target.rel,
+          kind: isDirectory ? 'directory' : 'file',
+          overwritten: destExisted,
+        });
+      })
+  );
+
   return server;
 }
 
@@ -424,7 +558,7 @@ http.listen(BIND_PORT, BIND_HOST, () => {
     bind_address: BIND_HOST,
     port: BIND_PORT,
     endpoint: `http://${BIND_HOST}:${BIND_PORT}${MCP_PATH}`,
-    tools: 'list_notes,read_note,search_notes,write_note,append_note',
+    tools: 'list_notes,read_note,search_notes,write_note,append_note,delete_note,move_note',
     allowed_hostnames: allowedHostnames.join(','),
     auth: 'cloudflare-access-jwt',
     auth_issuer: accessVerifier.issuer,
