@@ -12,6 +12,18 @@ export class VaultPathError extends Error {
 /** Directory names that are never readable, listable, writable, or searchable. */
 const EXCLUDED_SEGMENTS = new Set(['.obsidian', '.git']);
 
+/**
+ * Directory name used for recoverable deletes. Unlike EXCLUDED_SEGMENTS this is
+ * deliberately still addressable: delete_note writes into it, and a note can be
+ * restored out of it with move_note. It is only hidden from recursive walks, so
+ * trashed notes never pollute list_notes or search_notes results. Listing it
+ * explicitly (`list_notes directory=".trash"`) still works.
+ */
+export const TRASH_DIR = '.trash';
+
+/** Directory names skipped when walking, but still addressable by explicit path. */
+const HIDDEN_FROM_WALK = new Set([TRASH_DIR]);
+
 export interface ResolvedPath {
   /** Absolute, fully symlink-resolved path. Never sent to the client. */
   abs: string;
@@ -26,6 +38,17 @@ export interface ResolveOptions {
   mustExist?: boolean;
   /** Allow resolving the vault root itself (used by list_notes). */
   allowRoot?: boolean;
+}
+
+/**
+ * True when `child` is the same path as `parent` or nested underneath it.
+ * Uses path.relative rather than startsWith so a sibling directory whose name
+ * merely shares a prefix (`notes-old` vs `notes`) is not treated as nested.
+ */
+export function isSamePathOrInside(parentAbs: string, childAbs: string): boolean {
+  const rel = path.relative(parentAbs, childAbs);
+  if (rel === '') return true;
+  return !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
 export interface WalkOptions {
@@ -174,6 +197,7 @@ export class Vault {
       for (const entry of entries) {
         if (entry.isSymbolicLink()) continue; // never follow links out of the vault
         if (EXCLUDED_SEGMENTS.has(entry.name)) continue;
+        if (HIDDEN_FROM_WALK.has(entry.name)) continue; // trashed notes stay out of results
 
         const child = path.join(dir, entry.name);
         if (entry.isDirectory()) {
