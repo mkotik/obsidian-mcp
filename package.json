@@ -10,7 +10,8 @@
     "verify": "node test/mcp-verify.mjs",
     "postcheck": "node test/postcheck.mjs",
     "access-verify": "node test/access-verify.mjs",
-    "tools-verify": "node test/tools-verify.mjs"
+    "tools-verify": "node test/tools-verify.mjs",
+    "edit-verify": "node test/edit-verify.mjs"
   },
   "keywords": [
     "mcp",

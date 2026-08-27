@@ -29,7 +29,7 @@ Two decisions shape the whole implementation:
 
 ## Tools
 
-Seven tools, no more:
+Nine tools, no more:
 
 | Tool | Input | Behavior |
 |---|---|---|
@@ -38,15 +38,25 @@ Seven tools, no more:
 | `search_notes` | `query`, `limit?` | Case-insensitive literal text search, returns paths + snippets |
 | `write_note` | `path`, `content` | Creates or overwrites a `.md` note, creating parent dirs |
 | `append_note` | `path`, `content`, `create_if_missing?` | Appends UTF-8 text to a `.md` note |
+| `patch_note` | `path`, `old_text`, `new_text`, `expected_matches?` | Replaces an exact snippet in place; refuses to write if the anchor is missing or ambiguous |
 | `delete_note` | `path`, `permanent?` | Moves a `.md` note to `.trash/` (recoverable); `permanent: true` erases it |
-| `move_note` | `from`, `to`, `overwrite?` | Renames or moves a note **or a whole folder**, creating destination parents |
+| `move_note` | `from`, `to`, `overwrite?`, `update_links?` | Renames or moves a note **or a whole folder**, rewriting `[[wikilinks]]` that pointed at it |
+| `get_backlinks` | `path`, `limit?` | Lists notes linking to a note, with line numbers and link text |
 
 Deliberately **not** exposed: shell/command execution, arbitrary filesystem reads, package installation, network requests, or direct `ob` CLI invocation.
 
 `move_note` is what makes the vault reorganisable: it accepts a directory on both
 sides, so `move_note from="raw/journal" to="active/journal"` relocates the folder and
 everything inside it — including non-markdown attachments, which are moved with the
-folder even though they can never be addressed individually.
+folder even though they can never be addressed individually. It also repairs the
+`[[wikilinks]]` that pointed at whatever moved (see **Link handling**).
+
+`patch_note` is the tool to reach for when editing an existing note. `write_note`
+replaces the entire file, which means a model that re-emits a long note can silently
+drop a paragraph — and in a synced vault that loss propagates to every device before
+anyone notices. `patch_note` cannot do that: it only ever substitutes text it has
+already matched, and it refuses to write at all when the anchor is missing or appears a
+different number of times than expected.
 
 ## Authentication
 
@@ -129,11 +139,37 @@ change propagates to every device within seconds. Three properties keep that saf
   itself or into one of its own descendants is rejected up front rather than failing
   halfway and orphaning files.
 
-Both tools resolve **every** path they touch — source *and* destination — through the
-same sandbox as the read tools, so traversal, absolute paths, `~`, symlink escapes,
+All mutating tools resolve **every** path they touch — source *and* destination — through
+the same sandbox as the read tools, so traversal, absolute paths, `~`, symlink escapes,
 `.obsidian`/`.git`, and non-markdown targets are refused identically.
 
 Logging records tool name, relative path, and byte counts. **Note contents are never logged**, and neither are credentials or tokens. No secrets appear anywhere in this repository; the server reads only environment variables for configuration.
+
+## Link handling
+
+Obsidian resolves `[[Note]]` by basename, so moving a note between folders usually
+does *not* break a bare link — but a **rename** breaks every bare link to it, and a
+**folder move** breaks any path-form `[[folder/Note]]` link. `move_note` fixes both:
+
+- It snapshots the vault before the move, resolves every wikilink against that
+  snapshot, and rewrites only the links that actually pointed at something that moved.
+- Link *style* is preserved: a bare link stays bare when that remains unambiguous, and
+  a path-form link stays path-form. Embed prefixes (`![[...]]`), `#headings`, and
+  `|aliases` are carried through untouched.
+- An **ambiguous** bare target — two notes sharing a basename — is deliberately left
+  alone rather than guessed at, so a rewrite can never silently repoint a link at the
+  wrong note.
+- The response lists every note edited and every link changed, so a reorganisation is
+  auditable rather than a black box. Pass `update_links: false` to skip rewriting.
+
+Only wikilinks are rewritten. Markdown-style `[text](note.md)` links are left alone:
+their encoding rules vary, and rewriting them incorrectly is worse than not rewriting
+them. Because `move_note` reports what it changed, an unhandled link style stays
+visible instead of being quietly mangled.
+
+`get_backlinks` uses the same resolver, which is why it finds references that a plain
+text search would miss — a bare `[[Note]]`, a path-form link, and an aliased
+`[[Note|something else]]` all resolve to the same note.
 
 ## Configuration
 
@@ -193,6 +229,23 @@ attacks against both tools (traversal, absolute, `~`, `.obsidian`, `.git`, non-m
 directory delete, move in/out of the vault, folder-into-itself, clobbering an existing
 folder) and requires every one to be rejected. It removes its subtree on the way out.
 
+`test/edit-verify.mjs` covers `patch_note`, `get_backlinks`, and link-aware moves
+against a live authenticated endpoint:
+
+```bash
+MCP_URL=https://mcp.example.com/mcp MCP_BEARER=<access-token> npm run edit-verify
+```
+
+It asserts the patch refusals leave the note **byte-identical**, that backlinks are
+found through bare, path-form, aliased, and embed links, and that a rename rewrites
+bare links while a folder move leaves them alone (because they still resolve) and fixes
+path-form links instead. Like the other suites it works in its own throwaway subtree
+and cleans up after itself.
+
+The pure link logic — parsing, resolution, ambiguity refusal, style preservation — is
+also covered by unit assertions that need no server or vault; see `src/links.ts` for
+the contract each case pins down.
+
 ## Deployment
 
 [`obsidian-mcp.service`](obsidian-mcp.service) runs the server under systemd as an unprivileged user, restarting on failure and starting at boot. It is hardened with `ProtectSystem=strict` and `ProtectHome=read-only`, with the vault re-opened via `ReadWritePaths`, so the process cannot write anywhere else on the filesystem even if the application logic were bypassed.
@@ -208,11 +261,13 @@ systemctl status obsidian-mcp.service
 
 ```
 src/vault.ts       path sandbox: validation, containment, symlink resolution, markdown walk
+src/links.ts       wikilink parsing, resolution, and style-preserving rewriting
 src/access.ts      Cloudflare Access JWT verification (JWKS, issuer, audience, expiry)
 src/server.ts      MCP server, tool definitions, limits, logging, authenticated HTTP mount
 test/mcp-verify.mjs    full MCP client suite (functional + sandbox attacks)
 test/access-verify.mjs authentication suite (missing/malformed/forged/expired/wrong-aud)
 test/tools-verify.mjs  delete/move suite (trash, restore, folder moves, 18 sandbox cases)
+test/edit-verify.mjs   patch/backlinks/link-rewrite suite
 test/postcheck.mjs     short re-check against a running hardened service
 obsidian-mcp.service   systemd unit
 ```
