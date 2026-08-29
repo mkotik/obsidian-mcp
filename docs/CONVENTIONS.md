@@ -146,10 +146,19 @@ Checklist. Steps 1–3 are Cloudflare; 4–7 are the host.
 3. Add it to `MCP_PUBLIC_HOSTNAME` alongside the old one; restart.
 4. Verify both return 401 unauthenticated and both work authenticated.
 5. Move clients over.
-6. Remove the old hostname from all three places.
+6. Remove the old hostname from all three places, in **reverse** order: tunnel
+   route first, then the Access destination, then `MCP_PUBLIC_HOSTNAME`.
+   Deleting the tunnel route also deletes the DNS record.
 
-Order matters: if you add the host to the allowlist before Access covers it, the
-hostname is briefly reachable without Cloudflare authentication in front.
+Order matters in both directions, for the same reason — a hostname must never be
+routable while Access is not in front of it:
+
+- **Adding:** route → Access → allowlist leaves a brief window where the
+  hostname reaches the origin unauthenticated (the origin's host allowlist still
+  rejects it with 403, but that is the last line of defence, not the first).
+  Safest is to add the Access destination first.
+- **Removing:** delete the route first. That stops traffic before Access
+  protection is taken away.
 
 ---
 
@@ -159,12 +168,22 @@ hostname is briefly reachable without Cloudflare authentication in front.
 |---|---|
 | Host | `mcp-host`, Oracle Always Free, ARM64, 1 vCPU, 5.8 GB RAM, 41 GB free |
 | Tunnel | `personal-mcp` (`2c2de917-4a72-4cb9-8df8-de4ce9d7f6d4`) |
-| Obsidian MCP | `obsidian.deangoldsteen.com` + legacy `mcp.deangoldsteen.com` → `127.0.0.1:3000` |
-| Access app | `obsidian-mcp`, policy `owner-only`, two destinations, one AUD |
+| Obsidian MCP | `obsidian.deangoldsteen.com` → `127.0.0.1:3000` |
+| Access app | `obsidian-mcp`, policy `owner-only`, one destination |
 
-`mcp.deangoldsteen.com` is retained only so the existing Claude connector keeps
-working. Retire it once clients point at `obsidian.` — remove the tunnel route,
-the Access destination, and the entry in `MCP_PUBLIC_HOSTNAME`.
+`mcp.deangoldsteen.com` was retired on 2026-08-29. It read like a generic
+entry point but resolved to a single service, which would have been actively
+misleading once a second MCP existed. Deleting the tunnel route also removed
+its DNS record automatically.
+
+The name is now free. If a **gateway** MCP is ever built — one endpoint
+aggregating a curated subset of tools from every service, so a single connector
+serves all agents — `mcp.deangoldsteen.com` is the right name for it. Note the
+tradeoff that argues against building one prematurely: every tool's schema is
+injected into the model's context on every request, and selection accuracy falls
+as near-duplicate tools accumulate. A gateway that re-exports the union of all
+services (9 + 6 + 8 + …) buys one-URL convenience at the cost of a quality tax on
+every request. If built, curate rather than concatenate.
 
 ### Deployment
 
