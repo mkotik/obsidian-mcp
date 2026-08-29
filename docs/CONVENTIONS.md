@@ -37,6 +37,22 @@ certificate unless you buy Advanced Certificate Manager.
 
 So: always `<service>.deangoldsteen.com`. Never a deeper name.
 
+### When a tenant needs two hostnames
+
+A tenant with two different *callers* gets two hostnames and two Access
+applications, because they need different authentication. iMessage is the first
+such case: `imessage.deangoldsteen.com` is owner-only Managed OAuth for me,
+while `imessage-ingest.deangoldsteen.com` is a machine endpoint gated by an
+Access **service token** for the Mac sender.
+
+That produces one deliberate naming exception. The ingestion app is called
+`imessage-ingest`, not `imessage-ingest-mcp`, because it is not an MCP server —
+it is an ingestion API. The `-mcp` suffix is reserved for things that actually
+speak MCP.
+
+Port blocks are allocated per tenant in hundreds (`31xx`, `32xx`) rather than
+sequentially, so a tenant's services stay visually grouped.
+
 ### Port registry
 
 Every service binds to `127.0.0.1` on its own port. Nothing binds `0.0.0.0`.
@@ -44,9 +60,10 @@ Every service binds to `127.0.0.1` on its own port. Nothing binds `0.0.0.0`.
 
 | Port | Service | Status |
 |---:|---|---|
-| 3000 | obsidian | in use |
-| 3001 | imessage | reserved |
-| 3002 | *(next)* | free |
+| 3000 | obsidian mcp | in use |
+| 3100 | imessage ingest | in use |
+| 3200 | imessage mcp | in use |
+| 3300 | *(next tenant)* | free |
 | 20241 | cloudflared metrics | in use (not ours) |
 
 ---
@@ -169,7 +186,22 @@ routable while Access is not in front of it:
 | Host | `mcp-host`, Oracle Always Free, ARM64, 1 vCPU, 5.8 GB RAM, 41 GB free |
 | Tunnel | `personal-mcp` (`2c2de917-4a72-4cb9-8df8-de4ce9d7f6d4`) |
 | Obsidian MCP | `obsidian.deangoldsteen.com` → `127.0.0.1:3000` |
-| Access app | `obsidian-mcp`, policy `owner-only`, one destination |
+| iMessage ingest | `imessage-ingest.deangoldsteen.com` → `127.0.0.1:3100` |
+| iMessage MCP | `imessage.deangoldsteen.com` → `127.0.0.1:3200` |
+| Access apps | `obsidian-mcp` and `imessage-mcp` (`owner-only`); `imessage-ingest` (service token) |
+
+### Shared code is still not extracted
+
+`src/shared/access.ts` was **copied**, not shared, into `imessage-server`, and
+the two copies have now diverged: the iMessage copy gained a
+`principal: 'user' | 'service'` option plus `expectedCommonName` pinning,
+because Cloudflare service-token JWTs carry `common_name` instead of `sub` and
+the original explicitly rejected them.
+
+Two copies were the right call for two tenants. At the **third**, either
+back-port the principal option to Obsidian and extract a genuinely shared
+package, or accept the divergence deliberately and write it down. Do not let a
+third copy drift silently.
 
 `mcp.deangoldsteen.com` was retired on 2026-08-29. It read like a generic
 entry point but resolved to a single service, which would have been actively
