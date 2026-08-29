@@ -18,12 +18,20 @@ const BIND_PORT = Number(process.env.MCP_PORT ?? 3000);
 const MCP_PATH = '/mcp';
 
 /**
- * Public hostname this server is published under by Cloudflare Tunnel. Tunnel
- * traffic arrives with that Host header, so it has to be on the allowlist
- * alongside loopback; the allowlist is what keeps DNS-rebinding protection
- * meaningful instead of accepting any Host.
+ * Public hostname(s) this server is published under by Cloudflare Tunnel.
+ * Tunnel traffic arrives with that Host header, so each has to be on the
+ * allowlist alongside loopback; the allowlist is what keeps DNS-rebinding
+ * protection meaningful instead of accepting any Host.
+ *
+ * Accepts a comma-separated list so a hostname can be migrated without
+ * downtime: publish the new name, run both for a cutover window, then drop
+ * the old one. Entries are hostnames only — the SDK rejects any that carry a
+ * port — and blank entries are discarded so a trailing comma is harmless.
  */
-const PUBLIC_HOSTNAME = process.env.MCP_PUBLIC_HOSTNAME?.trim();
+const PUBLIC_HOSTNAMES = (process.env.MCP_PUBLIC_HOSTNAME ?? '')
+  .split(',')
+  .map((h) => h.trim())
+  .filter((h) => h.length > 0);
 
 // ---------------------------------------------------------------------------
 // Resource limits. These exist so a malformed or hostile request cannot make
@@ -700,7 +708,7 @@ const nodeHandler = toNodeHandler(handler);
 
 // Allowlist entries are hostnames only; the SDK strips the port from the Host
 // header before comparing, and rejects an entry that carries one.
-const allowedHostnames = ['127.0.0.1', 'localhost', ...(PUBLIC_HOSTNAME ? [PUBLIC_HOSTNAME] : [])];
+const allowedHostnames = ['127.0.0.1', 'localhost', ...PUBLIC_HOSTNAMES];
 const validateHost = hostHeaderValidation(allowedHostnames);
 const validateOrigin = originValidation(allowedHostnames);
 
