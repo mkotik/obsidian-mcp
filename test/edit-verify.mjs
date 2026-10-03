@@ -12,9 +12,10 @@
 const URL_ = process.env.MCP_URL;
 const BEARER = process.env.MCP_BEARER;
 const COOKIE = process.env.MCP_COOKIE;
+const ACCESS_JWT = process.env.MCP_ACCESS_JWT; // local runs: the Cf-Access-Jwt-Assertion itself
 
-if (!URL_ || (!BEARER && !COOKIE)) {
-  console.error('FATAL: set MCP_URL and one of MCP_BEARER / MCP_COOKIE to run these tests.');
+if (!URL_ || (!BEARER && !COOKIE && !ACCESS_JWT)) {
+  console.error('FATAL: set MCP_URL and one of MCP_BEARER / MCP_COOKIE / MCP_ACCESS_JWT to run these tests.');
   process.exit(78);
 }
 
@@ -37,6 +38,7 @@ async function rpc(method, params) {
   const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
   if (BEARER) headers.authorization = `Bearer ${BEARER}`;
   if (COOKIE) headers.cookie = `CF_Authorization=${COOKIE}`;
+  if (ACCESS_JWT) headers['cf-access-jwt-assertion'] = ACCESS_JWT;
 
   const res = await fetch(URL_, { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: nextId++, method, params }) });
   if (res.status !== 200) throw new Error(`${method} -> HTTP ${res.status}`);
@@ -76,7 +78,7 @@ async function main() {
   try {
     // =================================================== patch_note
     const BODY = '# Title\n\nalpha line\nbeta line\nalpha line\n\ntail\n';
-    await call('write_note', { path: p('patch/doc.md'), content: BODY });
+    await call('write_note', { stamp_dates: false, path: p('patch/doc.md'), content: BODY });
 
     {
       const r = await call('patch_note', { path: p('patch/doc.md'), old_text: 'beta line', new_text: 'BETA LINE' });
@@ -113,7 +115,7 @@ async function main() {
     }
 
     {
-      await call('write_note', { path: p('patch/del.md'), content: 'keep\nDELETE ME\nkeep2\n' });
+      await call('write_note', { stamp_dates: false, path: p('patch/del.md'), content: 'keep\nDELETE ME\nkeep2\n' });
       const r = await call('patch_note', { path: p('patch/del.md'), old_text: 'DELETE ME\n', new_text: '' });
       const body = await read(p('patch/del.md'));
       check('empty new_text deletes the anchor', !r.isError && !body.includes('DELETE ME') && body.includes('keep2'));
@@ -132,12 +134,12 @@ async function main() {
     }
 
     // =================================================== get_backlinks
-    await call('write_note', { path: p('links/Target Note.md'), content: '# Target\n\nbody\n' });
-    await call('write_note', { path: p('links/bare.md'), content: `refs [[Target Note]] here\n` });
-    await call('write_note', { path: p('links/pathform.md'), content: `refs [[${ROOT}/links/Target Note]] here\n` });
-    await call('write_note', { path: p('links/embed.md'), content: `embed ![[Target Note]]\n` });
-    await call('write_note', { path: p('links/alias.md'), content: `alias [[Target Note|Shown]]\n` });
-    await call('write_note', { path: p('links/none.md'), content: 'no links at all\n' });
+    await call('write_note', { stamp_dates: false, path: p('links/Target Note.md'), content: '# Target\n\nbody\n' });
+    await call('write_note', { stamp_dates: false, path: p('links/bare.md'), content: `refs [[Target Note]] here\n` });
+    await call('write_note', { stamp_dates: false, path: p('links/pathform.md'), content: `refs [[${ROOT}/links/Target Note]] here\n` });
+    await call('write_note', { stamp_dates: false, path: p('links/embed.md'), content: `embed ![[Target Note]]\n` });
+    await call('write_note', { stamp_dates: false, path: p('links/alias.md'), content: `alias [[Target Note|Shown]]\n` });
+    await call('write_note', { stamp_dates: false, path: p('links/none.md'), content: 'no links at all\n' });
 
     {
       const r = await call('get_backlinks', { path: p('links/Target Note.md'), limit: 50 });
@@ -174,8 +176,8 @@ async function main() {
 
     // =================================================== folder move
     {
-      await call('write_note', { path: p('folder/journal/Entry One.md'), content: '# Entry One\n' });
-      await call('write_note', { path: p('folder/ref.md'), content: `bare [[Entry One]] and path [[${ROOT}/folder/journal/Entry One]]\n` });
+      await call('write_note', { stamp_dates: false, path: p('folder/journal/Entry One.md'), content: '# Entry One\n' });
+      await call('write_note', { stamp_dates: false, path: p('folder/ref.md'), content: `bare [[Entry One]] and path [[${ROOT}/folder/journal/Entry One]]\n` });
 
       const r = await call('move_note', { from: p('folder/journal'), to: p('folder/active') });
       const d = json(r);
@@ -189,21 +191,21 @@ async function main() {
 
     // =================================================== opt out
     {
-      await call('write_note', { path: p('optout/Keep Name.md'), content: '# Keep\n' });
-      await call('write_note', { path: p('optout/ref.md'), content: 'see [[Keep Name]]\n' });
+      await call('write_note', { stamp_dates: false, path: p('optout/Keep Name.md'), content: '# Keep\n' });
+      await call('write_note', { stamp_dates: false, path: p('optout/ref.md'), content: 'see [[Keep Name]]\n' });
 
       const r = await call('move_note', { from: p('optout/Keep Name.md'), to: p('optout/New Name.md'), update_links: false });
       const ref = await read(p('optout/ref.md'));
       check('update_links=false skips rewriting', !r.isError && json(r).links_updated?.enabled === false && ref.includes('[[Keep Name]]'), ref.trim());
     }
   } finally {
-    const remaining = json(await call('list_notes', { directory: ROOT, limit: 2000 })).notes ?? [];
+    const remaining = (json(await call('list_notes', { directory: ROOT, limit: 2000 })).notes ?? []).map((n) => n.path ?? n);
     for (const note of remaining) await call('delete_note', { path: note, permanent: true });
 
-    const trashed = json(await call('list_notes', { directory: '.trash', limit: 2000 })).notes ?? [];
+    const trashed = (json(await call('list_notes', { directory: '.trash', limit: 2000 })).notes ?? []).map((n) => n.path ?? n);
     for (const note of trashed.filter((x) => x.includes(ROOT))) await call('delete_note', { path: note, permanent: true });
 
-    const after = json(await call('list_notes', { limit: 3000 })).notes ?? [];
+    const after = (json(await call('list_notes', { limit: 3000 })).notes ?? []).map((n) => n.path ?? n);
     check('all test notes cleaned up', after.filter((x) => x.startsWith(`${ROOT}/`)).length === 0);
   }
 

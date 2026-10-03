@@ -20,9 +20,10 @@
 const URL_ = process.env.MCP_URL;
 const BEARER = process.env.MCP_BEARER;
 const COOKIE = process.env.MCP_COOKIE;
+const ACCESS_JWT = process.env.MCP_ACCESS_JWT; // local runs: the Cf-Access-Jwt-Assertion itself
 
-if (!URL_ || (!BEARER && !COOKIE)) {
-  console.error('FATAL: set MCP_URL and one of MCP_BEARER / MCP_COOKIE to run these tests.');
+if (!URL_ || (!BEARER && !COOKIE && !ACCESS_JWT)) {
+  console.error('FATAL: set MCP_URL and one of MCP_BEARER / MCP_COOKIE / MCP_ACCESS_JWT to run these tests.');
   process.exit(78);
 }
 
@@ -43,6 +44,7 @@ function authHeaders() {
   const h = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
   if (BEARER) h.authorization = `Bearer ${BEARER}`;
   if (COOKIE) h.cookie = `CF_Authorization=${COOKIE}`;
+  if (ACCESS_JWT) h['cf-access-jwt-assertion'] = ACCESS_JWT;
   return h;
 }
 
@@ -150,7 +152,7 @@ async function main() {
 
     // ------------------------------------------------- trash is hidden, not listed
     {
-      const listing = json(await call('list_notes', { limit: 2000 })).notes ?? [];
+      const listing = (json(await call('list_notes', { limit: 2000 })).notes ?? []).map((n) => n.path ?? n);
       check('trashed notes absent from list_notes', listing.filter((x) => x.startsWith('.trash/')).length === 0);
 
       const search = json(await call('search_notes', { query: 'beta marker', limit: 20 }));
@@ -201,15 +203,15 @@ async function main() {
     }
   } finally {
     // ------------------------------------------------------------- teardown
-    const remaining = json(await call('list_notes', { directory: ROOT, limit: 2000 })).notes ?? [];
+    const remaining = (json(await call('list_notes', { directory: ROOT, limit: 2000 })).notes ?? []).map((n) => n.path ?? n);
     for (const note of remaining) await call('delete_note', { path: note, permanent: true });
 
-    const trashed = json(await call('list_notes', { directory: '.trash', limit: 2000 })).notes ?? [];
+    const trashed = (json(await call('list_notes', { directory: '.trash', limit: 2000 })).notes ?? []).map((n) => n.path ?? n);
     for (const note of trashed.filter((x) => x.includes(ROOT))) {
       await call('delete_note', { path: note, permanent: true });
     }
 
-    const after = json(await call('list_notes', { limit: 2000 })).notes ?? [];
+    const after = (json(await call('list_notes', { limit: 2000 })).notes ?? []).map((n) => n.path ?? n);
     check('all test notes cleaned up', after.filter((x) => x.startsWith(`${ROOT}/`)).length === 0);
     console.log(
       `\n  note: empty directories under ${ROOT}/ and .trash/ may remain; the tool surface\n` +

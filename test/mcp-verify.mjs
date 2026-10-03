@@ -38,7 +38,8 @@ function isErr(result) {
 }
 
 const client = new Client({ name: 'mcp-verify', version: '1.0.0' });
-const transport = new StreamableHTTPClientTransport(new URL(URL_MCP));
+const headers = process.env.MCP_ACCESS_JWT ? { 'cf-access-jwt-assertion': process.env.MCP_ACCESS_JWT } : {};
+const transport = new StreamableHTTPClientTransport(new URL(URL_MCP), { requestInit: { headers } });
 
 async function call(name, args) {
   return client.callTool({ name, arguments: args });
@@ -52,12 +53,15 @@ async function main() {
 
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
-  const expected = ['append_note', 'list_notes', 'read_note', 'search_notes', 'write_note'];
-  check('exactly the 5 expected tools exposed', JSON.stringify(names) === JSON.stringify(expected), names.join(','));
+  const expected = [
+    'add_image', 'append_note', 'create_upload_link', 'delete_note', 'get_backlinks', 'list_notes', 'list_tags',
+    'move_note', 'patch_note', 'read_image', 'read_note', 'search_notes', 'update_tags', 'write_note',
+  ];
+  check(`exactly the ${expected.length} expected tools exposed`, JSON.stringify(names) === JSON.stringify(expected), names.join(','));
 
   // ------------------------------------------------------------- read tests
   const listed = payload(await call('list_notes', { limit: 500 }));
-  const existing = (listed.notes ?? []).filter((p) => !p.startsWith('_mcp_test/'));
+  const existing = (listed.notes ?? []).map((n) => n.path ?? n).filter((p) => !p.startsWith('_mcp_test/'));
   check('list_notes returned existing notes', existing.length > 0, `${listed.total_found} notes found`);
   check('list_notes returns only .md paths', existing.every((p) => p.endsWith('.md')));
   check('list_notes returns no absolute paths', existing.every((p) => !p.startsWith('/')));
@@ -95,7 +99,7 @@ async function main() {
 
   // ------------------------------------------------------------ listing test
   const relisted = payload(await call('list_notes', { limit: 2000 }));
-  check('list_notes finds _mcp_test/verification.md', (relisted.notes ?? []).includes(TEST_NOTE));
+  check('list_notes finds _mcp_test/verification.md', (relisted.notes ?? []).map((n) => n.path ?? n).includes(TEST_NOTE));
 
   // ------------------------------------------------- search the new content
   const searchNew = payload(await call('search_notes', { query: 'append-test-ok' }));
@@ -153,7 +157,7 @@ async function main() {
     const linkWrite = await call('write_note', { path: linkRel, content: 'pwned' });
     check('write_note rejects symlink escaping the vault', isErr(linkWrite));
     const linkList = payload(await call('list_notes', { limit: 2000 }));
-    check('list_notes does not follow the escape symlink', !(linkList.notes ?? []).includes(linkRel));
+    check('list_notes does not follow the escape symlink', !(linkList.notes ?? []).map((n) => n.path ?? n).includes(linkRel));
   } finally {
     await rm(linkAbs, { force: true });
   }
