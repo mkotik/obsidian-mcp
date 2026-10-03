@@ -214,13 +214,14 @@ serves all agents — `mcp.deangoldsteen.com` is the right name for it. Note the
 tradeoff that argues against building one prematurely: every tool's schema is
 injected into the model's context on every request, and selection accuracy falls
 as near-duplicate tools accumulate. A gateway that re-exports the union of all
-services (9 + 6 + 8 + …) buys one-URL convenience at the cost of a quality tax on
+services (14 + 6 + 8 + …) buys one-URL convenience at the cost of a quality tax on
 every request. If built, curate rather than concatenate.
 
 ### Deployment
 
 There are no git credentials on the host. Deployment is: edit locally → `scp` →
-`npm run build` → `systemctl restart`. GitHub is updated separately through the
+`npm ci && npm run build` → `systemctl restart` (and re-install the unit file when it
+changed — v1.1 added `StateDirectory=obsidian-mcp`). GitHub is updated separately through the
 web UI, and file hashes are compared across local, host, and GitHub to confirm
 the three copies match. A deploy key would remove this friction and is the
 obvious next improvement.
