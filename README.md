@@ -24,26 +24,31 @@ to Cloudflare; nothing dials in. The only open inbound port on the host is SSH.
 Two decisions shape the whole implementation:
 
 1. **Loopback only.** The server binds explicitly to `127.0.0.1`, never `0.0.0.0`. Public reachability is provided entirely by Cloudflare Tunnel, which makes an *outbound* connection — so the host never opens an inbound port, and the origin is unreachable over its public IP.
-2. **The vault is the only reachable filesystem.** Every client-supplied path is untrusted input. There is no shell tool and no general filesystem access — because a note-editing agent does not need them, and their absence removes whole categories of failure. The tools that *do* mutate the vault (write, append, delete, move) are each confined to the same path sandbox, and deletes are recoverable by default.
+2. **The vault is the only reachable filesystem.** Every client-supplied path is untrusted input. There is no shell tool and no general filesystem access — because a note-editing agent does not need them, and their absence removes whole categories of failure. The tools that *do* mutate the vault (write, append, patch, tag, image, delete, move) are each confined to the same path sandbox, and deletes are recoverable by default.
 3. **No unauthenticated request reaches a tool — including from localhost.** The process refuses to start without Cloudflare Access configuration, and validates the Access JWT on every `/mcp` request. There is deliberately no loopback bypass: anything that can reach port 3000 (another local process, a future misconfigured proxy, a compromised dependency) still has to present a valid, Cloudflare-signed assertion.
 
 ## Tools
 
-Nine tools, no more:
+Fourteen tools:
 
 | Tool | Input | Behavior |
 |---|---|---|
-| `list_notes` | `directory?`, `limit?` | Recursively lists `.md` files, returns vault-relative paths |
-| `read_note` | `path` | Reads one `.md` note |
-| `search_notes` | `query`, `limit?` | Case-insensitive literal text search, returns paths + snippets |
-| `write_note` | `path`, `content` | Creates or overwrites a `.md` note, creating parent dirs |
-| `append_note` | `path`, `content`, `create_if_missing?` | Appends UTF-8 text to a `.md` note |
-| `patch_note` | `path`, `old_text`, `new_text`, `expected_matches?` | Replaces an exact snippet in place; refuses to write if the anchor is missing or ambiguous |
+| `list_notes` | `directory?`, `tags?`, `modified_after?`/`_before?`, `created_after?`/`_before?`, `sort?`, `limit?` | Lists `.md` notes with created/modified dates and tags, **most recently changed first** |
+| `read_note` | `path`, `include_images?` | Reads one `.md` note plus its dates and tags; optionally returns the images it embeds |
+| `search_notes` | `query`, same filters as `list_notes`, `sort?`, `limit?` | Literal text search over body, file name, and tags; **ranked by relevance weighted toward recent edits** |
+| `write_note` | `path`, `content`, `stamp_dates?` | Creates or overwrites a `.md` note, creating parent dirs; keeps `created:`/`updated:` current |
+| `append_note` | `path`, `content`, `create_if_missing?`, `stamp_dates?` | Appends UTF-8 text to a `.md` note |
+| `patch_note` | `path`, `old_text`, `new_text`, `expected_matches?`, `stamp_dates?` | Replaces an exact snippet in place; refuses to write if the anchor is missing or ambiguous |
 | `delete_note` | `path`, `permanent?` | Moves a `.md` note to `.trash/` (recoverable); `permanent: true` erases it |
 | `move_note` | `from`, `to`, `overwrite?`, `update_links?` | Renames or moves a note **or a whole folder**, rewriting `[[wikilinks]]` that pointed at it |
 | `get_backlinks` | `path`, `limit?` | Lists notes linking to a note, with line numbers and link text |
+| `list_tags` | `prefix?`, `directory?`, `limit?` | Every tag in use, with note counts and last use — the vocabulary to tag against |
+| `update_tags` | `path`, `add?`, `remove?`, `preserve_modified?` | Adds/removes frontmatter tags without touching anything else in the note |
+| `add_image` | `url` or `data_base64`, `filename?`, `folder?`, `note_path?`, `after_text?`, `width?`, `create_note?` | Saves an image into the vault and optionally embeds it as `![[...]]` |
+| `read_image` | `path` | Returns a vault image as image content so the model can see it |
+| `create_upload_link` | `note_path?`, `folder?`, `create_note?`, `expires_minutes?` | Mints a single-use upload page for images from a phone or computer |
 
-Deliberately **not** exposed: shell/command execution, arbitrary filesystem reads, package installation, network requests, or direct `ob` CLI invocation.
+Deliberately **not** exposed: shell/command execution, arbitrary filesystem reads, package installation, general network requests, or direct `ob` CLI invocation. The one outbound request the server can make is `add_image`'s https image download, which is fenced (see **Images**).
 
 `move_note` is what makes the vault reorganisable: it accepts a directory on both
 sides, so `move_note from="raw/journal" to="active/journal"` relocates the folder and
@@ -57,6 +62,112 @@ drop a paragraph — and in a synced vault that loss propagates to every device 
 anyone notices. `patch_note` cannot do that: it only ever substitutes text it has
 already matched, and it refuses to write at all when the anchor is missing or appears a
 different number of times than expected.
+
+## Dates and recency
+
+Every note result carries `created` and `modified`, as ISO timestamps in the vault's
+timezone (`NOTE_TIMEZONE`, default `America/New_York`):
+
+- **`modified`** is the filesystem mtime. It is authoritative: it moves on every edit
+  from any device, because Obsidian Sync preserves the source mtime when it downloads.
+- **`created`** is the frontmatter `created:` when present and parseable, otherwise the
+  earliest of birthtime, mtime, and a remembered "first seen" time. Birthtime alone is
+  not trustworthy on this host: every note's birthtime is the moment Obsidian Sync
+  first downloaded it, and a sync that replaces a file resets it. The first-seen index
+  (`/var/lib/obsidian-mcp/first-seen.json`, via systemd `StateDirectory=`) stops the
+  date from drifting forward across restarts, and `move_note` carries it to the new path.
+  `created_source` says which one was used.
+- A frontmatter `updated:` is reported as `updated_frontmatter`, never preferred over
+  mtime; if the two differ by more than a day and a half the note is flagged
+  `dates_mismatch: true`.
+
+`list_notes` and `search_notes` filter on either date with `modified_after`,
+`modified_before`, `created_after`, `created_before`. Each accepts `YYYY-MM-DD`, an ISO
+timestamp, `today`, `yesterday`, or a relative age (`7d`, `2w`, `3m`, `1y`). A bare date
+used as an upper bound includes that whole day. Responses include `now` so "this week"
+is unambiguous to the model.
+
+**Ranking.** `list_notes` defaults to most-recently-modified first. `search_notes`
+scores each hit as *relevance × recency*: relevance is `3` for a file-name hit, `2` for a
+tag hit, plus `log2(1 + body matches)`; recency is `0.4 + 0.6 × 0.5^(age / half-life)`
+with a 30-day half-life (`RECENCY_HALF_LIFE_DAYS`). A note edited today gets the full
+weight, a note untouched for months keeps 40%, so recent work rises to the top but a
+much stronger match on an old note still wins. `sort: "modified" | "created"` overrides it.
+
+**Stamping.** The write tools keep frontmatter dates current: a note gets `created:`
+if it has none (the existing creation time, never "now" for an old note) and `updated:`
+refreshed to today. Values follow the vault's convention, `YYYY-MM-DD`. An existing
+`created:` is never changed, a placeholder such as `YYYY-MM-DD` in a template is left
+alone, a note whose frontmatter is not valid YAML is not touched, and `write_note`
+carries the original `created:` forward even when the new content omits it. Pass
+`stamp_dates: false` per call, or set `STAMP_DATES=false`, to write verbatim. Links that
+`move_note` rewrites in other notes are mechanical and are not stamped.
+
+Frontmatter edits are line-based rather than parse-and-reserialize: only the lines of
+the key being changed are replaced, so other keys, comments, quoting, and plugin keys
+(Excalidraw, Dataview) stay byte-identical — which matters in a synced vault, where
+reformatting churn would land on every device.
+
+## Tags
+
+Tags are read the way Obsidian reads them: frontmatter `tags:` (or legacy `tag:`) as a
+list or a comma/space-separated string, plus inline `#tags` in the body, ignoring code
+blocks, inline code, and `%%comments%%`. Matching is case-insensitive, and a parent tag
+matches its nested children (`project` matches `project/alpha`).
+
+- `list_notes` / `search_notes` take `tags: [...]` (all must match). `search_notes` also
+  matches the query against tags.
+- `list_tags` returns the vault's tag vocabulary with counts and last use. Its tool
+  description tells the model to consult it before tagging, so tags are reused rather
+  than duplicated (`ml` vs `machine-learning`).
+- `update_tags` adds and removes tags in the frontmatter `tags:` list only. Input is
+  normalised (`#Reading List` → `Reading-List`), deduplicated case-insensitively, and
+  validated (letters, digits, `-`, `_`, `/`; not purely numeric). It writes the note's
+  existing style — a block list stays a block list, otherwise the vault's flow style
+  `tags: [a, b]`. Inline tags are prose and are never rewritten; if a removal leaves one
+  behind, the response says so (`still_inline`).
+- By default `update_tags` **preserves the note's modified time** (nudged forward 1 s so
+  sync still sees a newer version). Otherwise bulk re-tagging would make hundreds of
+  old notes look freshly edited and wreck recency ranking. `preserve_modified: false`
+  treats the edit as a real update.
+
+## Images
+
+An MCP client can only pass a tool text arguments, so there are three ways in:
+
+| Route | Use it for |
+|---|---|
+| `add_image` with `url` | An image on the web. The server downloads it. |
+| `add_image` with `data_base64` | Small images the model genuinely has bytes for (a generated chart). Impractical for photos — the model would have to emit megabytes of base64. |
+| `create_upload_link` | **An image attached in chat, or on your phone.** The model can see a chat attachment but cannot hand its bytes to a tool, so it gives you a single-use link instead; you open it, pick images, and they land in the vault, embedded in the note. |
+
+Images are saved under the attachments folder (`ATTACHMENTS_DIR`, else Obsidian's
+`attachmentFolderPath` setting, else `attachments/`) and embedded with an unambiguous
+path-form link, `![[attachments/name.png]]` or `![[attachments/name.png|300]]`.
+`read_image` and `read_note include_images: true` return images as MCP image content so
+the model can actually see them.
+
+Safety properties:
+
+- **Format comes from the bytes.** PNG, JPEG, GIF, and WebP are identified by magic
+  number; the caller's file name and declared type are ignored, and the extension is
+  always the detected one. HEIC is refused with a specific message (Obsidian cannot
+  render it everywhere); the upload page asks iOS for JPEG, which it converts to.
+- **Never overwrites.** Files are created with `O_EXCL`; a name collision gets a ` 1`,
+  ` 2` suffix. File names are sanitised (no separators, control characters, `..` runs,
+  or leading dots) and every folder goes through the same path sandbox as notes.
+- **The download is fenced.** https only, no credentials in the URL, at most 3 redirects
+  (each re-checked), 15 s timeout, 20 MB cap enforced while streaming, and the response
+  must actually be an image. The DNS lookup used *by the socket itself* refuses
+  loopback, RFC 1918, link-local (including the `169.254.169.254` metadata service),
+  CGNAT, multicast, and IPv6 equivalents, so a DNS-rebinding answer cannot slip in
+  between check and connect.
+- **Upload links are capabilities on top of auth, not instead of it.** `/upload/<token>`
+  sits behind the same Cloudflare Access application and the same JWT verification as
+  `/mcp`. The token is 192 random bits, single-use (consumed once anything is stored),
+  expires (30 minutes by default, 24 hours max), is held only in memory (a restart
+  revokes all of them), and at most 20 can be outstanding. The page sends a strict CSP,
+  `no-store`, and `no-referrer` so the token does not leak.
 
 ## Authentication
 
@@ -105,7 +216,7 @@ All path handling lives in [`src/vault.ts`](src/vault.ts). A client path is reje
 - **Normalized, then contained** — containment is checked with `path.relative()`, not `startsWith()`. A bare prefix check would let `/home/ubuntu/vaults/main-evil` masquerade as `/home/ubuntu/vaults/main`.
 - **Re-validated after `realpath()`** — the *resolved* path must still sit inside the vault, so a symlink inside the vault pointing at `/etc/passwd` is rejected rather than followed. For files that don't exist yet, the deepest existing ancestor is resolved and the missing segments re-attached, so a symlinked parent directory can't smuggle a write out either.
 - **Excluded directories** — any path segment named `.obsidian` or `.git` is refused, for reads, writes, listing, and search alike.
-- **Markdown only** — reads, writes, and appends require a `.md` extension.
+- **Markdown only** — note reads, writes, and appends require a `.md` extension. The image tools are the one exception: they read and create only files whose bytes are PNG/JPEG/GIF/WebP, and never overwrite.
 - **Symlinks are never followed while walking** — directory traversal skips symlink entries entirely.
 
 Resource limits exist so a malformed or hostile request can't exhaust memory:
@@ -118,6 +229,12 @@ Resource limits exist so a malformed or hostile request can't exhaust memory:
 | `search_notes` results | 100 max (20 default) |
 | Notes scanned per search | 5000 |
 | Directory depth | 24 |
+| Image saved (any route) | 20 MiB |
+| `data_base64` argument | 12 MiB of text (~9 MiB image) |
+| Image returned to the client | 5 MiB (model input limit) |
+| Images per `read_note include_images` | 4, 10 MiB total |
+| One browser upload | 100 MiB, 20 files |
+| Outstanding upload links | 20 |
 | Process memory (systemd) | 512 MiB |
 
 ### Destructive tools
@@ -180,14 +297,19 @@ text search would miss — a bare `[[Note]]`, a path-form link, and an aliased
 | `MCP_PORT` | `3000` |
 | `CF_ACCESS_TEAM_DOMAIN` | *required* — e.g. `https://myteam.cloudflareaccess.com` |
 | `CF_ACCESS_AUD` | *required* — the Access application's 64-char AUD tag |
-| `MCP_PUBLIC_HOSTNAME` | optional — public hostname to add to the Host/Origin allowlist |
+| `MCP_PUBLIC_HOSTNAME` | optional — public hostname(s) for the Host/Origin allowlist; the first is also the base URL of upload links |
+| `NOTE_TIMEZONE` | `America/New_York` — how dates are read from and written to frontmatter |
+| `STATE_DIR` | `$STATE_DIRECTORY` (systemd) — where the created-date index is kept; unset means memory only |
+| `RECENCY_HALF_LIFE_DAYS` | `30` — how fast search's recency boost decays |
+| `STAMP_DATES` | `true` — set `false` to stop write tools maintaining `created:`/`updated:` |
+| `ATTACHMENTS_DIR` | Obsidian's `attachmentFolderPath`, else `attachments` |
 
 `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` are **not secrets** (the AUD tag is a public
 identifier; the trust anchor is Cloudflare's signing key, fetched at runtime). They are
 required all the same: if either is missing or malformed the process logs a config error
 and exits `78` rather than serving the vault unauthenticated.
 
-Local endpoint: `http://127.0.0.1:3000/mcp` (Streamable HTTP). Any other path returns 404.
+Local endpoint: `http://127.0.0.1:3000/mcp` (Streamable HTTP), plus `/upload/<token>` for upload links. Any other path returns 404.
 
 ## Requirements
 
@@ -242,6 +364,18 @@ bare links while a folder move leaves them alone (because they still resolve) an
 path-form links instead. Like the other suites it works in its own throwaway subtree
 and cleans up after itself.
 
+`test/features-verify.mjs` covers dates, ranking, stamping, tags, and images — 84
+checks including SSRF refusals, filename traversal, upload-link single use, and
+created-date survival across renames:
+
+```bash
+MCP_URL=https://obsidian.example.com/mcp MCP_BEARER=<access-token> npm run features-verify
+```
+
+Run locally with `VAULT_ROOT` set as well, and it also backdates file times to assert
+ranking and date-window filters deterministically. All suites accept `MCP_ACCESS_JWT`
+(the raw `Cf-Access-Jwt-Assertion`) in place of `MCP_BEARER` for local runs.
+
 The pure link logic — parsing, resolution, ambiguity refusal, style preservation — is
 also covered by unit assertions that need no server or vault; see `src/links.ts` for
 the contract each case pins down.
@@ -262,12 +396,18 @@ systemctl status obsidian-mcp.service
 ```
 src/vault.ts       path sandbox: validation, containment, symlink resolution, markdown walk
 src/links.ts       wikilink parsing, resolution, and style-preserving rewriting
+src/notes.ts       per-note dates and tags, metadata cache, created-date index, recency weight
+src/frontmatter.ts YAML frontmatter parsing and line-preserving key edits
+src/edit.ts        date stamping and tag edits built on frontmatter.ts
+src/tags.ts        Obsidian tag extraction, normalisation, nested matching
+src/images.ts      image detection, safe names, fenced https download, upload pages
 src/access.ts      Cloudflare Access JWT verification (JWKS, issuer, audience, expiry)
 src/server.ts      MCP server, tool definitions, limits, logging, authenticated HTTP mount
 test/mcp-verify.mjs    full MCP client suite (functional + sandbox attacks)
 test/access-verify.mjs authentication suite (missing/malformed/forged/expired/wrong-aud)
 test/tools-verify.mjs  delete/move suite (trash, restore, folder moves, 18 sandbox cases)
 test/edit-verify.mjs   patch/backlinks/link-rewrite suite
+test/features-verify.mjs dates/ranking/stamping/tags/images suite
 test/postcheck.mjs     short re-check against a running hardened service
 obsidian-mcp.service   systemd unit
 ```

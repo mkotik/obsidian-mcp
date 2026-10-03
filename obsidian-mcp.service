@@ -13,6 +13,7 @@ Environment=NODE_ENV=production
 Environment=VAULT_ROOT=/home/ubuntu/vaults/main
 Environment=MCP_HOST=127.0.0.1
 Environment=MCP_PORT=3000
+Environment=NOTE_TIMEZONE=America/New_York
 
 # --- Cloudflare Access (not secrets: the team domain and AUD tag are public
 # --- identifiers; the trust anchor is Cloudflare's rotating JWKS, fetched at
@@ -31,6 +32,10 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/ubuntu/vaults/main
+# /var/lib/obsidian-mcp: the created-date index (exported to the app as STATE_DIRECTORY).
+# systemd creates it owned by User= and keeps it writable under ProtectSystem=strict.
+StateDirectory=obsidian-mcp
+StateDirectoryMode=0700
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
