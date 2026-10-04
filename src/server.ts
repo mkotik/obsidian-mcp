@@ -9,6 +9,7 @@ import * as z from 'zod';
 import { Vault, VaultPathError, TRASH_DIR, isSamePathOrInside } from './vault.js';
 import { LinkIndex, rewriteLinks, findLinksTo, parseLinks } from './links.js';
 import { NoteIndex, publicMeta, recencyWeight, parseDateFilter, formatIsoLocal } from './notes.js';
+import { AccessTracker } from './activity.js';
 import type { NoteMeta } from './notes.js';
 import { stampDates, editTags } from './edit.js';
 import { normalizeTag, hasAllTags, inlineTags, tagMatches } from './tags.js';
@@ -31,7 +32,7 @@ import { createAccessVerifier, AccessConfigError } from './access.js';
 import type { AccessVerifier } from './access.js';
 
 const SERVER_NAME = 'obsidian-vault';
-const SERVER_VERSION = '1.3.0';
+const SERVER_VERSION = '1.4.0';
 
 const VAULT_ROOT = process.env.VAULT_ROOT ?? '/home/ubuntu/vaults/main';
 const BIND_HOST = process.env.MCP_HOST ?? '127.0.0.1';
@@ -52,6 +53,9 @@ const STATE_DIR = process.env.STATE_DIR ?? process.env.STATE_DIRECTORY;
 
 /** Ranking: a note's recency weight halves every this many days since it last changed. */
 const RECENCY_HALF_LIFE_DAYS = Math.max(1, Number(process.env.RECENCY_HALF_LIFE_DAYS ?? 30));
+
+/** Ranking: each read/edit's contribution to a note's frequency score halves every this many days. */
+const FREQUENCY_HALF_LIFE_DAYS = Math.max(1, Number(process.env.FREQUENCY_HALF_LIFE_DAYS ?? 14));
 
 /** Stamp `created:` / `updated:` frontmatter on notes the server writes. On unless set to "false". */
 const STAMP_DATES_DEFAULT = (process.env.STAMP_DATES ?? 'true').toLowerCase() !== 'false';
@@ -119,6 +123,26 @@ const noteIndex = await NoteIndex.open({
   stateDir: STATE_DIR,
   maxFileBytes: LIMITS.searchFileBytes,
 });
+const access = await AccessTracker.open({
+  stateDir: STATE_DIR,
+  halfLifeDays: FREQUENCY_HALF_LIFE_DAYS,
+  ignorePrefixes: [`${TRASH_DIR}/`],
+});
+
+/** Last time a note was changed or accessed through the server, epoch ms. */
+function touchedMs(m: NoteMeta): number {
+  return Math.max(m.modifiedMs, access.lastAccessMs(m.path) ?? 0);
+}
+
+/**
+ * Activity weight in [0.3, 1] used by search ranking: a floor so relevance
+ * always dominates, plus recency of the last change and decayed access
+ * frequency. An old note still opened weekly (~0.47) outranks one written once
+ * months ago and never reopened (~0.30).
+ */
+function activityWeight(m: NoteMeta, now: number): number {
+  return 0.3 + 0.4 * recencyWeight(m.modifiedMs, RECENCY_HALF_LIFE_DAYS, now) + 0.3 * access.frequency(m.path, now);
+}
 
 /** Public base URL for upload links, from the first published hostname. */
 const PUBLIC_BASE_URL = PUBLIC_HOSTNAMES.length > 0 ? `https://${PUBLIC_HOSTNAMES[0]}` : null;
@@ -209,6 +233,10 @@ const filterFields = {
   modified_before: z.string().max(40).optional().describe(`Only notes last changed at or before this time (a bare date includes that whole day). ${DATE_FILTER_HELP}`),
   created_after: z.string().max(40).optional().describe(`Only notes created at or after this time. ${DATE_FILTER_HELP}`),
   created_before: z.string().max(40).optional().describe(`Only notes created at or before this time (a bare date includes that whole day). ${DATE_FILTER_HELP}`),
+  accessed_after: z.string().max(40).optional().describe(`Only notes read or edited through this server at or after this time (never-accessed notes are excluded). ${DATE_FILTER_HELP}`),
+  accessed_before: z.string().max(40).optional().describe(`Only notes last read or edited through this server at or before this time; never-accessed notes are included. ${DATE_FILTER_HELP}`),
+  touched_after: z.string().max(40).optional().describe(`Only notes changed OR accessed at or after this time — e.g. "what did I touch this week" is touched_after="7d". ${DATE_FILTER_HELP}`),
+  touched_before: z.string().max(40).optional().describe(`Only notes neither changed nor accessed since this time. ${DATE_FILTER_HELP}`),
 };
 
 interface FilterInput {
@@ -217,17 +245,26 @@ interface FilterInput {
   modified_before?: string;
   created_after?: string;
   created_before?: string;
+  accessed_after?: string;
+  accessed_before?: string;
+  touched_after?: string;
+  touched_before?: string;
 }
 
 type NotePredicate = (m: NoteMeta) => boolean;
 
 /** Build a predicate from filter arguments, or return a client-facing error string. */
 function buildFilter(input: FilterInput): { test: NotePredicate; active: boolean } | { error: string } {
-  const bounds: Array<[keyof FilterInput, 'createdMs' | 'modifiedMs', 'min' | 'max']> = [
-    ['modified_after', 'modifiedMs', 'min'],
-    ['modified_before', 'modifiedMs', 'max'],
-    ['created_after', 'createdMs', 'min'],
-    ['created_before', 'createdMs', 'max'],
+  const accessed = (m: NoteMeta): number => access.lastAccessMs(m.path) ?? 0;
+  const bounds: Array<[keyof FilterInput, (m: NoteMeta) => number, 'min' | 'max']> = [
+    ['modified_after', (m) => m.modifiedMs, 'min'],
+    ['modified_before', (m) => m.modifiedMs, 'max'],
+    ['created_after', (m) => m.createdMs, 'min'],
+    ['created_before', (m) => m.createdMs, 'max'],
+    ['accessed_after', accessed, 'min'],
+    ['accessed_before', accessed, 'max'],
+    ['touched_after', touchedMs, 'min'],
+    ['touched_before', touchedMs, 'max'],
   ];
   const checks: NotePredicate[] = [];
   for (const [key, field, kind] of bounds) {
@@ -235,7 +272,7 @@ function buildFilter(input: FilterInput): { test: NotePredicate; active: boolean
     if (raw === undefined || raw.trim() === '') continue;
     const at = parseDateFilter(raw, TIME_ZONE, kind === 'max');
     if (at === null) return { error: `${key} "${raw}" is not a recognised date. ${DATE_FILTER_HELP}` };
-    checks.push(kind === 'min' ? (m) => m[field] >= at : (m) => m[field] <= at);
+    checks.push(kind === 'min' ? (m) => field(m) >= at : (m) => field(m) <= at);
   }
   if (input.tags && input.tags.length > 0) {
     const wanted: string[] = [];
@@ -251,7 +288,7 @@ function buildFilter(input: FilterInput): { test: NotePredicate; active: boolean
 
 /** Compact per-note shape used in list/search results. */
 function noteSummary(m: NoteMeta): Record<string, unknown> {
-  const out: Record<string, unknown> = { path: m.path, created: m.created, modified: m.modified, tags: m.tags };
+  const out: Record<string, unknown> = { path: m.path, created: m.created, modified: m.modified, ...access.stats(m.path), tags: m.tags };
   if (m.dates_mismatch) out.dates_mismatch = true;
   return out;
 }
@@ -280,6 +317,7 @@ async function writeNoteText(
   }
   await writeFile(abs, out, 'utf8');
   noteIndex.forget(rel);
+  access.record(rel, 'edit');
   return { text: out, stamped };
 }
 
@@ -459,8 +497,9 @@ function buildServer(): McpServer {
     'list_notes',
     {
       description:
-        'List markdown notes with their created date, last-modified date, and tags. Newest-changed first by default, so recently edited notes come first. ' +
-        'Filter by tag and/or by created/modified date range — e.g. "what did I change this week" is modified_after="7d"; "notes tagged project" is tags=["project"]. ' +
+        'List markdown notes with their created date, last-modified date, access stats (last_accessed, access_30d, access_total — reads/edits through this server), and tags. Newest-changed first by default. ' +
+        'Filter by tag and/or by created/modified/accessed/touched date range — e.g. "what did I touch this week" is touched_after="7d"; "notes tagged project" is tags=["project"]. ' +
+        'Sorts: "top 20 most-accessed" is sort="frequency", limit=20; "oldest untouched note" is sort="stale". ' +
         'Only .md files are returned; .obsidian, .git and .trash are excluded.',
       inputSchema: z.object({
         directory: z
@@ -470,9 +509,12 @@ function buildServer(): McpServer {
           .describe('Optional vault-relative subdirectory to list. Omit to list the whole vault.'),
         ...filterFields,
         sort: z
-          .enum(['modified', 'created', 'path'])
+          .enum(['modified', 'created', 'accessed', 'frequency', 'stale', 'path'])
           .optional()
-          .describe('modified (default): most recently changed first. created: newest first. path: alphabetical.'),
+          .describe(
+            'modified (default): most recently changed first. created: newest first. accessed: most recently read/edited first (never-accessed last). ' +
+              'frequency: most-used first (decayed read/edit frequency, recent use counts more). stale: longest untouched first (oldest of last change and last access). path: alphabetical.'
+          ),
         limit: z
           .number()
           .int()
@@ -503,8 +545,20 @@ function buildServer(): McpServer {
         const metas = (await noteIndex.getMany(files)).filter(filter.test);
 
         const order = sort ?? 'modified';
+        const now = Date.now();
         if (order === 'modified') metas.sort((a, b) => b.modifiedMs - a.modifiedMs);
         else if (order === 'created') metas.sort((a, b) => b.createdMs - a.createdMs);
+        else if (order === 'accessed') {
+          metas.sort((a, b) => (access.lastAccessMs(b.path) ?? -1) - (access.lastAccessMs(a.path) ?? -1) || b.modifiedMs - a.modifiedMs);
+        } else if (order === 'frequency') {
+          const freq = new Map(metas.map((m) => [m.path, access.score(m.path, now)]));
+          metas.sort(
+            (a, b) =>
+              freq.get(b.path)! - freq.get(a.path)! ||
+              access.stats(b.path, now).access_total - access.stats(a.path, now).access_total ||
+              b.modifiedMs - a.modifiedMs
+          );
+        } else if (order === 'stale') metas.sort((a, b) => touchedMs(a) - touchedMs(b) || a.path.localeCompare(b.path));
         else metas.sort((a, b) => a.path.localeCompare(b.path));
 
         const page = metas.slice(0, cap);
@@ -526,7 +580,7 @@ function buildServer(): McpServer {
     'read_note',
     {
       description:
-        'Read a markdown note, with its created date, last-modified date, and tags. Path must be relative to the vault root. ' +
+        'Read a markdown note, with its created date, last-modified date, tags, and access stats. Path must be relative to the vault root. Each read is counted toward the note\'s access frequency. ' +
         'Set include_images=true to also receive the images the note embeds (![[image.png]]) so you can see them.',
       inputSchema: z.object({
         path: z.string().max(1024).describe('Vault-relative path to a .md note, e.g. "notes/idea.md".'),
@@ -585,10 +639,12 @@ function buildServer(): McpServer {
         }
 
         log('read_note', { path: target.rel, bytes: st.size, images: images.length });
+        access.record(target.rel, 'read');
         const body: Record<string, unknown> = {
           path: target.rel,
           bytes: st.size,
           ...(meta ? publicMeta(meta) : {}),
+          access: access.detail(target.rel),
           content,
         };
         if (include_images === true) body.images = imageReport;
@@ -604,15 +660,15 @@ function buildServer(): McpServer {
     {
       description:
         'Case-insensitive plain-text search across markdown notes (body, file name, and tags). ' +
-        'Results are ranked by relevance weighted toward recently changed notes, so a note edited this week outranks an equally relevant one untouched for months. ' +
-        'Supports the same tag and created/modified date filters as list_notes. Each result carries created/modified dates, tags, and snippets.',
+        'Results are ranked by relevance weighted toward notes that are recently changed and frequently used (both decay over time), so an old note still opened weekly outranks one written once months ago and never reopened. ' +
+        'Supports the same tag and created/modified/accessed/touched date filters as list_notes. Each result carries created/modified dates, access stats, tags, and snippets.',
       inputSchema: z.object({
         query: z.string().min(1).max(512).describe('Text to search for (case-insensitive, literal — not a regex).'),
         ...filterFields,
         sort: z
           .enum(['relevance', 'modified', 'created'])
           .optional()
-          .describe('relevance (default): match strength weighted by recency. modified / created: newest first among matches.'),
+          .describe('relevance (default): match strength weighted by recency and access frequency. modified / created: newest first among matches.'),
         limit: z
           .number()
           .int()
@@ -694,9 +750,9 @@ function buildServer(): McpServer {
           // Relevance: a title or tag hit is a strong signal; body hits add with
           // diminishing returns so one long note cannot drown out the rest.
           const relevance = (inName ? 3 : 0) + (inTags ? 2 : 0) + Math.log2(1 + matches);
-          // Recency multiplier in [0.4, 1]: recent edits lift a note, but an old
-          // note that matches much better still wins.
-          const score = relevance * (0.4 + 0.6 * recencyWeight(meta.modifiedMs, RECENCY_HALF_LIFE_DAYS, now));
+          // Activity multiplier in [0.3, 1]: recent edits and frequent use lift a
+          // note, but an old note that matches much better still wins.
+          const score = relevance * activityWeight(meta, now);
           const matched_in = [...(inName ? ['name'] : []), ...(inTags ? ['tags'] : []), ...(matches > 0 ? ['body'] : [])];
           hits.push({ meta, matches, snippets, score, matched_in });
         }
@@ -707,6 +763,8 @@ function buildServer(): McpServer {
         else hits.sort((a, b) => b.meta.createdMs - a.meta.createdMs);
 
         const page = hits.slice(0, cap);
+        // Counted for analytics only; search hits never feed ranking (no feedback loop).
+        access.recordSearchHits(page.map((h) => h.meta.path));
         log('search_notes', { query_len: query.length, notes_scanned: scanned, hits: hits.length, filtered: filter.active });
         return ok({
           query,
@@ -854,6 +912,7 @@ function buildServer(): McpServer {
         noteIndex.forget(target.rel);
         if (permanent === true || inTrash) {
           await unlink(target.abs);
+          access.forget(target.rel);
           log('delete_note', { path: target.rel, permanent: true, bytes: st.size });
           return ok({ path: target.rel, deleted: true, permanent: true, recoverable: false });
         }
@@ -873,6 +932,7 @@ function buildServer(): McpServer {
           await unlink(target.abs);
         }
 
+        access.recordMove(new Map([[target.rel, trashTarget.rel]]));
         log('delete_note', { path: target.rel, permanent: false, bytes: st.size });
         return ok({
           path: target.rel,
@@ -973,8 +1033,10 @@ function buildServer(): McpServer {
           const { files: after } = await vault.walkMarkdown(target.abs, { maxFiles: LIMITS.walkFiles, maxDepth: LIMITS.walkDepth });
           for (const f of after) movedNotes.set(`${prefix}${f.slice(target.rel.length + 1)}`, f);
           noteIndex.recordMove(movedNotes);
+          access.recordMove(movedNotes);
         } else {
           noteIndex.recordMove(new Map([[source.rel, target.rel]]));
+          access.recordMove(new Map([[source.rel, target.rel]]));
         }
 
         // Link rewriting happens after the move so the "after" index reflects
@@ -1874,6 +1936,8 @@ http.listen(BIND_PORT, BIND_HOST, () => {
       'list_notes,read_note,search_notes,write_note,append_note,patch_note,delete_note,move_note,get_backlinks,list_tags,update_tags,add_image,read_image,create_upload_link,start_image_upload',
     timezone: TIME_ZONE,
     created_index: noteIndex.persistent ? 'persistent' : 'memory-only',
+    access_index: access.persistent ? 'persistent' : 'memory-only',
+    access_tracked_notes: access.size,
     allowed_hostnames: allowedHostnames.join(','),
     auth: 'cloudflare-access-jwt',
     auth_issuer: accessVerifier.issuer,
@@ -1886,6 +1950,7 @@ async function shutdown(signal: string): Promise<void> {
   log('shutdown', { signal });
   http.close();
   await noteIndex.flush();
+  await access.flush();
   await handler.close();
   process.exit(0);
 }
