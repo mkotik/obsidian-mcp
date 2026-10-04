@@ -11,7 +11,7 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import * as path from 'node:path';
 
 const URL_MCP = process.env.MCP_URL ?? 'http://127.0.0.1:3999/mcp';
@@ -94,6 +94,13 @@ const gh = createServer(async (req, res) => {
     if (kids.length === 0) return send(404, { message: 'Not Found' });
     return send(200, kids.map((e) => ({ type: 'file', path: e.path, name: path.posix.basename(e.path), size: blobs.get(e.sha).length })));
   }
+  if (req.method === 'PUT' && rest.startsWith('contents/')) {
+    const target = rest.slice('contents/'.length);
+    if (json.branch !== 'main' || typeof json.content !== 'string') return send(422, { message: 'bad body' });
+    if (currentEntries().some((e) => e.path === target)) return send(422, { message: 'sha wasn\'t supplied' });
+    seed({ [target]: Buffer.from(json.content, 'base64') });
+    return send(201, { content: { path: target } });
+  }
   if (req.method === 'GET' && rest === 'git/ref/heads/main') return send(200, { object: { sha: head } });
   if (req.method === 'GET' && rest.startsWith('git/commits/')) return send(200, { tree: { sha: commits.get(rest.slice(12)).tree } });
   if (req.method === 'GET' && rest.startsWith('git/trees/')) return send(200, { tree: trees.get(rest.slice(10)), truncated: false });
@@ -157,6 +164,29 @@ try {
   check('malformed upload_id is rejected', badId.isError && text(badId).includes('not valid'));
   const trav = await call('import_uploaded_images', { upload_id: id, note_path: '../outside.md' });
   check('note_path traversal is rejected', trav.isError === true);
+
+  // Run the script for real against the fake API (the path Claude's sandbox uses).
+  const sRun = payload(await call('start_image_upload', {})); // fresh script for idRun
+  const idRun = sRun.upload_id;
+  await writeFile('/tmp/push-run.sh', sRun.script);
+  await writeFile('/tmp/up a.png', PNG);
+  await writeFile('/tmp/up-b.jpg', JPEG);
+  let runOut = '';
+  const runAsync = (args) =>
+    new Promise((resolve) => execFile('bash', args, { timeout: 60000 }, (err, stdout, stderr) => resolve({ err, out: String(stdout) + String(stderr) })));
+  {
+    const r1 = await runAsync(['/tmp/push-run.sh', '/tmp/up a.png', '/tmp/up-b.jpg']);
+    runOut = (r1.err ? 'ERR ' : '') + r1.out;
+  }
+  check('script uploads via the contents API', runOut.includes('PUSHED 2 file(s)') && !runOut.includes('trying git'), runOut.slice(0, 300));
+  check('script output never shows the token', !runOut.includes(TOKEN));
+  const imp4 = payload(await call('import_uploaded_images', { upload_id: idRun, note_path: `${ROOT}/Scripted.md`, create_note: true }));
+  check('script-uploaded files import (name with space too)', imp4.images?.length === 2, JSON.stringify(imp4).slice(0, 300));
+  tokenOk = false;
+  let badOut = '';
+  badOut = (await runAsync(['/tmp/push-run.sh', '/tmp/up-b.jpg'])).out;
+  tokenOk = true;
+  check('rejected token -> PUSH FAILED with HTTP code, token masked', badOut.includes('HTTP 401') && badOut.includes('PUSH FAILED') && !badOut.includes(TOKEN), badOut.slice(0, 300));
 
   seed({
     [`inbox/${id}/IMG_0001.png`]: PNG,
