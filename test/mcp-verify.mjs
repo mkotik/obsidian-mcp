@@ -54,8 +54,8 @@ async function main() {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   const expected = [
-    'add_image', 'append_note', 'create_upload_link', 'delete_note', 'get_backlinks', 'list_notes', 'list_tags',
-    'move_note', 'patch_note', 'read_image', 'read_note', 'search_notes', 'update_tags', 'write_note',
+    'add_image', 'append_note', 'create_upload_link', 'delete_note', 'get_backlinks', 'import_uploaded_images', 'list_notes', 'list_tags',
+    'move_note', 'patch_note', 'read_image', 'read_note', 'search_notes', 'start_image_upload', 'update_tags', 'write_note',
   ];
   check(`exactly the ${expected.length} expected tools exposed`, JSON.stringify(names) === JSON.stringify(expected), names.join(','));
 
