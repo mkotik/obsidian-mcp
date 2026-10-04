@@ -117,6 +117,9 @@ service; a single weak tenant compromises the host.
    hostile input.
 8. **No secrets in the repo.** Scan before every commit. The tunnel token, SSH
    keys, and any object-storage credentials live only on the host, mode 0600.
+   Service secrets go in `/etc/<service>/` (root, 0600) and reach the process
+   through systemd `LoadCredential=`, never `Environment=` (the obsidian
+   inbox token is the reference: `/etc/obsidian-mcp/inbox-token`).
 
 Non-secret and safe to commit: the Zero Trust team domain, the Access AUD tag,
 hostnames, ports.
@@ -214,7 +217,7 @@ serves all agents — `mcp.deangoldsteen.com` is the right name for it. Note the
 tradeoff that argues against building one prematurely: every tool's schema is
 injected into the model's context on every request, and selection accuracy falls
 as near-duplicate tools accumulate. A gateway that re-exports the union of all
-services (14 + 6 + 8 + …) buys one-URL convenience at the cost of a quality tax on
+services (16 + 6 + 8 + …) buys one-URL convenience at the cost of a quality tax on
 every request. If built, curate rather than concatenate.
 
 ### Deployment
