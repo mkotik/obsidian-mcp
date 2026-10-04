@@ -32,7 +32,7 @@ import { createAccessVerifier, AccessConfigError } from './access.js';
 import type { AccessVerifier } from './access.js';
 
 const SERVER_NAME = 'obsidian-vault';
-const SERVER_VERSION = '1.2.0';
+const SERVER_VERSION = '1.2.1';
 
 const VAULT_ROOT = process.env.VAULT_ROOT ?? '/home/ubuntu/vaults/main';
 const BIND_HOST = process.env.MCP_HOST ?? '127.0.0.1';
@@ -1467,7 +1467,7 @@ function buildServer(): McpServer {
         'Step 1 of adding an image the user attached in chat to the vault (preferred over create_upload_link). ' +
         'Returns an upload_id and a bash script. In your code execution sandbox: save the script to /tmp/push.sh and run ' +
         '`bash /tmp/push.sh <file>...` on the attached file(s) (look in /mnt/user-data/uploads/; run `ls -la` there). ' +
-        'It git-pushes them to a private relay repo on github.com. When it prints PUSHED, call import_uploaded_images with the same upload_id. ' +
+        'It uploads them to a private relay repo on GitHub (via api.github.com). When it prints PUSHED, call import_uploaded_images with the same upload_id. ' +
         'HEIC is not supported: convert to JPEG in the sandbox first. Never show the script or its URL to the user; it contains a credential.',
       inputSchema: z.object({}),
     },
@@ -1481,7 +1481,7 @@ function buildServer(): McpServer {
           upload_id: id,
           script,
           next: 'Write script to /tmp/push.sh in your code sandbox, run: bash /tmp/push.sh /mnt/user-data/uploads/<file> ..., then call import_uploaded_images with this upload_id.',
-          if_push_fails: 'If git cannot reach github.com from the sandbox, fall back to create_upload_link.',
+          if_push_fails: 'If the script prints PUSH FAILED, show the user its error lines, then fall back to create_upload_link. It needs network egress with api.github.com allowed.',
         });
       })
   );
