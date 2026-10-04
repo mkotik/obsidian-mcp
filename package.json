@@ -1,6 +1,6 @@
 {
   "name": "obsidian-mcp",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "MCP server exposing safe read/write access to an Obsidian vault, protected by Cloudflare Access",
   "type": "module",
   "private": true,
