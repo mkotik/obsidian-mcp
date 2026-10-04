@@ -114,6 +114,9 @@ service; a single weak tenant compromises the host.
 5. **Never log** note or message contents, tokens, JWTs, cookies, or the owner's
    email. Permitted vocabulary: `Authentication succeeded`,
    `Authentication rejected: missing token`, `Authentication rejected: invalid token`.
+   The same applies to persisted state: `first-seen.json` and `access.json` in the
+   StateDirectory hold paths, timestamps and counts only (mode 0600), never content
+   or search queries.
 6. **systemd hardening is copied verbatim** from `obsidian-mcp.service`:
    `User=ubuntu`, `NoNewPrivileges`, `ProtectSystem=strict` with a narrow
    `ReadWritePaths`, `ProtectHome=read-only`, `RestrictAddressFamilies`,
