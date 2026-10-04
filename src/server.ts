@@ -27,11 +27,12 @@ import {
   messagePage,
 } from './images.js';
 import type { ImageType } from './images.js';
+import { Inbox, InboxError, inboxConfigFromEnv, newUploadId, isUploadId } from './inbox.js';
 import { createAccessVerifier, AccessConfigError } from './access.js';
 import type { AccessVerifier } from './access.js';
 
 const SERVER_NAME = 'obsidian-vault';
-const SERVER_VERSION = '1.1.0';
+const SERVER_VERSION = '1.2.0';
 
 const VAULT_ROOT = process.env.VAULT_ROOT ?? '/home/ubuntu/vaults/main';
 const BIND_HOST = process.env.MCP_HOST ?? '127.0.0.1';
@@ -117,6 +118,9 @@ const noteIndex = await NoteIndex.open({
   maxFileBytes: LIMITS.searchFileBytes,
 });
 
+/** GitHub inbox relay for chat-attached images (see inbox.ts). */
+const inbox = new Inbox(inboxConfigFromEnv(process.env));
+
 /** Public base URL for upload links, from the first published hostname. */
 const PUBLIC_BASE_URL = PUBLIC_HOSTNAMES.length > 0 ? `https://${PUBLIC_HOSTNAMES[0]}` : null;
 
@@ -148,7 +152,7 @@ async function guard(tool: string, body: () => Promise<ToolResult>): Promise<Too
   try {
     return await body();
   } catch (err) {
-    if (err instanceof VaultPathError || err instanceof FetchImageError) {
+    if (err instanceof VaultPathError || err instanceof FetchImageError || err instanceof InboxError) {
       log('tool.rejected', { tool, reason: err.message });
       return fail(err.message);
     }
@@ -1291,7 +1295,7 @@ function buildServer(): McpServer {
       description:
         'Save an image into the vault and optionally embed it in a note as ![[...]]. Provide exactly one source: ' +
         'url (a public https image — the server downloads it) or data_base64 (only for small images whose bytes you actually have, e.g. a generated chart). ' +
-        'For an image the user attached in chat, you cannot pass its bytes here — use create_upload_link instead. ' +
+        'For an image the user attached in chat, you cannot pass its bytes here — use start_image_upload instead. ' +
         'Supported: PNG, JPEG, GIF, WebP. The format is checked from the bytes.',
       inputSchema: z.object({
         url: z.string().max(4096).optional().describe('https:// URL of the image to download.'),
@@ -1401,7 +1405,8 @@ function buildServer(): McpServer {
     {
       description:
         'Create a single-use web link where the user can upload images (from a phone or computer) straight into the vault, optionally embedding them in a note. ' +
-        'Use this whenever the user wants to add an image they attached in chat or have on their device: give them the link, and after they say it is done, read_note shows the new embeds. ' +
+        'Fallback only: for an image attached in chat, use start_image_upload first; offer this link only if that fails or you have no code execution. ' +
+        'Give them the link, and after they say it is done, read_note shows the new embeds. ' +
         'The page is protected by the same login as this server.',
       inputSchema: z.object({
         note_path: z.string().max(1024).optional().describe('Vault-relative .md note to embed the uploaded images in (appended at the end).'),
@@ -1450,6 +1455,119 @@ function buildServer(): McpServer {
           note_path: noteRel,
           folder: dir.rel || '.',
           instructions: 'Share this link with the user. They open it, sign in if asked, pick images, and press Upload. Then call read_note to confirm the embeds.',
+        });
+      })
+  );
+
+  // ------------------------------------------------------- start_image_upload
+  server.registerTool(
+    'start_image_upload',
+    {
+      description:
+        'Step 1 of adding an image the user attached in chat to the vault (preferred over create_upload_link). ' +
+        'Returns an upload_id and a bash script. In your code execution sandbox: save the script to /tmp/push.sh and run ' +
+        '`bash /tmp/push.sh <file>...` on the attached file(s) (look in /mnt/user-data/uploads/; run `ls -la` there). ' +
+        'It git-pushes them to a private relay repo on github.com. When it prints PUSHED, call import_uploaded_images with the same upload_id. ' +
+        'HEIC is not supported: convert to JPEG in the sandbox first. Never show the script or its URL to the user; it contains a credential.',
+      inputSchema: z.object({}),
+    },
+    async () =>
+      guard('start_image_upload', async () => {
+        if (!inbox.configured) return fail('the image inbox is not configured on this server; use create_upload_link instead');
+        const id = newUploadId();
+        const script = await inbox.pushScript(id);
+        log('start_image_upload', { upload_id: id });
+        return ok({
+          upload_id: id,
+          script,
+          next: 'Write script to /tmp/push.sh in your code sandbox, run: bash /tmp/push.sh /mnt/user-data/uploads/<file> ..., then call import_uploaded_images with this upload_id.',
+          if_push_fails: 'If git cannot reach github.com from the sandbox, fall back to create_upload_link.',
+        });
+      })
+  );
+
+  // --------------------------------------------------- import_uploaded_images
+  server.registerTool(
+    'import_uploaded_images',
+    {
+      description:
+        'Step 2 after start_image_upload: pull the pushed images into the vault (attachments folder by default), optionally embed them in a note, ' +
+        'and delete them from the relay repo. Supported: PNG, JPEG, GIF, WebP.',
+      inputSchema: z.object({
+        upload_id: z.string().max(64).describe('The upload_id returned by start_image_upload.'),
+        note_path: z.string().max(1024).optional().describe('Vault-relative .md note to embed the images in.'),
+        after_text: z
+          .string()
+          .max(LIMITS.patchChars)
+          .optional()
+          .describe('Embed on a new line after the line containing this exact text (must occur once). Omit to append at the end.'),
+        width: z.number().int().min(16).max(4000).optional().describe('Display width in pixels for the embeds.'),
+        filename: z.string().max(200).optional().describe('File name (without extension) to save as. With several images, a number is appended.'),
+        folder: z.string().max(1024).optional().describe('Vault-relative folder. Defaults to the attachments folder.'),
+        create_note: z.boolean().optional().describe('Create note_path if it does not exist. Defaults to false.'),
+      }),
+    },
+    async ({ upload_id, note_path, after_text, width, filename, folder, create_note }) =>
+      guard('import_uploaded_images', async () => {
+        if (!inbox.configured) return fail('the image inbox is not configured on this server');
+        if (!isUploadId(upload_id)) return fail('upload_id is not valid; call start_image_upload first');
+        if (note_path !== undefined) await vault.resolve(note_path, { requireMarkdown: true });
+
+        const files = await inbox.listUpload(upload_id);
+        if (files.length === 0) return fail('nothing has been pushed for this upload_id yet (did the push script print PUSHED?)');
+        if (files.length > 20) return fail('too many files in one upload (max 20)');
+
+        const dest = folder ?? (await defaultAttachmentFolder(note_path ?? null));
+        const saved: Array<{ path: string; bytes: number; mime: string }> = [];
+        const errors: string[] = [];
+        for (const f of files) {
+          try {
+            if (f.size > LIMITS.imageBytes) throw new InboxError(`${f.name} is larger than the ${LIMITS.imageBytes / 1048576} MB limit`);
+            const data = await inbox.download(f.path, LIMITS.imageBytes);
+            const type = detectImage(data);
+            if (!type) {
+              errors.push(`${f.name}: ${looksLikeHeic(data) ? 'HEIC is not supported; convert to JPEG and upload again' : 'not a PNG, JPEG, GIF, or WebP image'}`);
+              continue;
+            }
+            const stem = filename !== undefined && filename.trim() !== '' ? filename : f.name.replace(/\.[A-Za-z0-9]{1,5}$/, '');
+            const s = await saveImage(data, type, { filename: stem.length >= 1 ? stem : undefined, folder: dest });
+            saved.push({ path: s.rel, bytes: s.bytes, mime: type.mime });
+          } catch (err) {
+            if (err instanceof InboxError || err instanceof VaultPathError) errors.push(`${f.name}: ${err.message}`);
+            else throw err;
+          }
+        }
+
+        let embedded: Awaited<ReturnType<typeof embedInNote>> | null = null;
+        let embedError: string | undefined;
+        const embeds = saved.map((s) => embedFor(s.path, width));
+        if (note_path !== undefined && embeds.length > 0) {
+          try {
+            embedded = await embedInNote(note_path, embeds, { afterText: after_text, create: create_note === true, stamp: STAMP_DATES_DEFAULT });
+          } catch (err) {
+            embedError = err instanceof VaultPathError ? err.message : 'could not edit the note';
+          }
+        }
+
+        // Remove the upload from the relay repo whatever happened; the vault now holds the copies.
+        let cleanup: string;
+        try {
+          const r = await inbox.purge(new Set(files.map((f) => f.path)));
+          cleanup = `removed ${r.removed} file(s) from the relay repo`;
+        } catch (err) {
+          cleanup = `could not clean the relay repo: ${err instanceof InboxError ? err.message : 'error'}`;
+        }
+
+        log('import_uploaded_images', { upload_id, saved: saved.length, failed: errors.length, embedded: embedded !== null });
+        if (saved.length === 0) return fail(`no images imported. ${errors.join('; ')}`);
+        return ok({
+          images: saved,
+          embeds,
+          embedded: embedded !== null,
+          ...(embedded ? { note_path: embedded.path, note_created: embedded.created, dates_stamped: embedded.stamped } : {}),
+          ...(embedError ? { embed_error: embedError } : {}),
+          ...(errors.length ? { errors } : {}),
+          cleanup,
         });
       })
   );
@@ -1681,7 +1799,7 @@ http.listen(BIND_PORT, BIND_HOST, () => {
     port: BIND_PORT,
     endpoint: `http://${BIND_HOST}:${BIND_PORT}${MCP_PATH}`,
     tools:
-      'list_notes,read_note,search_notes,write_note,append_note,patch_note,delete_note,move_note,get_backlinks,list_tags,update_tags,add_image,read_image,create_upload_link',
+      'list_notes,read_note,search_notes,write_note,append_note,patch_note,delete_note,move_note,get_backlinks,list_tags,update_tags,add_image,read_image,create_upload_link,start_image_upload,import_uploaded_images',
     timezone: TIME_ZONE,
     created_index: noteIndex.persistent ? 'persistent' : 'memory-only',
     allowed_hostnames: allowedHostnames.join(','),
