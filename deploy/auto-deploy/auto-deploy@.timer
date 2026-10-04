@@ -1,0 +1,10 @@
+[Unit]
+Description=Check GitHub for new commits to %i every 3 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=3min
+RandomizedDelaySec=20s
+
+[Install]
+WantedBy=timers.target

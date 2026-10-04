@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# auto-deploy NAME — pull mkotik/<repo> main and, if it moved, build, test,
+# swap into the live directory, restart, health-check, and roll back on failure.
+# Config: /etc/auto-deploy/NAME.conf. Runs from auto-deploy@NAME.service (root);
+# git, npm ci, build and tests run as the unprivileged `deploy` user.
+set -uo pipefail
+NAME=${1:?usage: auto-deploy NAME}
+CONF=/etc/auto-deploy/$NAME.conf
+[ -f "$CONF" ] || { echo "no config $CONF"; exit 2; }
+# shellcheck disable=SC1090
+. "$CONF"   # REMOTE LIVE_DIR LIVE_OWNER SERVICES UNIT_FILES TEST_CMD HEALTH [NPM_CI_FLAGS]
+STATE=/var/lib/auto-deploy
+SRC=/var/lib/deploy/src/$NAME
+BUILD=/var/lib/deploy/build/$NAME
+PREV=/var/lib/deploy/prev/$NAME
+BLOG=/var/lib/deploy/build/$NAME.log
+install -d -m 700 "$STATE"
+log() { echo "[$NAME] $*"; }
+as_deploy() { runuser -u deploy -- env HOME=/var/lib/deploy PATH=/usr/local/bin:/usr/bin:/bin "$@"; }
+
+exec 9>"/run/auto-deploy-$NAME.lock"
+flock -n 9 || { log "another run is in progress"; exit 0; }
+
+if [ ! -d "$SRC/.git" ]; then
+  as_deploy git clone -q --branch main "$REMOTE" "$SRC" || { log "FAILED: clone"; exit 1; }
+fi
+as_deploy git -C "$SRC" fetch -q origin main || { log "FAILED: fetch (network or deploy key)"; exit 1; }
+NEW=$(as_deploy git -C "$SRC" rev-parse origin/main)
+CUR=$(cat "$STATE/$NAME.deployed" 2>/dev/null || echo none)
+[ "$NEW" = "$CUR" ] && [ "${FORCE:-0}" != 1 ] && exit 0
+if [ "$(cat "$STATE/$NAME.failed" 2>/dev/null)" = "$NEW" ] && [ "${FORCE:-0}" != 1 ]; then
+  exit 0   # this commit already failed; wait for the next one instead of retrying every few minutes
+fi
+SUBJECT=$(as_deploy git -C "$SRC" log -1 --format=%s "$NEW" | cut -c1-120)
+log "deploying ${NEW:0:12} (was ${CUR:0:12}): $SUBJECT"
+fail() { log "FAILED at $1 for ${NEW:0:12}; live version unchanged"; [ -f "$BLOG" ] && tail -n 25 "$BLOG" | sed "s/^/[$NAME]   /"; echo "$NEW" > "$STATE/$NAME.failed"; exit 1; }
+
+# ---- build and test as `deploy`, outside the live directory
+as_deploy rm -rf "$BUILD"; as_deploy mkdir -p "$BUILD"; : > "$BLOG"; chown deploy:deploy "$BLOG"
+as_deploy bash -c "git -C '$SRC' archive '$NEW' | tar -x -C '$BUILD'" >>"$BLOG" 2>&1 || fail export
+as_deploy bash -c "cd '$BUILD' && npm ci --no-audit --no-fund --loglevel=error ${NPM_CI_FLAGS:-}" >>"$BLOG" 2>&1 || fail "npm ci"
+as_deploy bash -c "cd '$BUILD' && npm run -s build" >>"$BLOG" 2>&1 || fail build
+if [ -n "${TEST_CMD:-}" ]; then
+  as_deploy bash -c "cd '$BUILD' && $TEST_CMD" >>"$BLOG" 2>&1 || fail tests
+fi
+
+# ---- swap: keep the running version for rollback, then replace it
+install -d -m 755 "$PREV"
+rsync -a --delete "$LIVE_DIR/" "$PREV/" || fail "snapshot of live"
+rsync -a --delete --chown="$LIVE_OWNER" "$BUILD/" "$LIVE_DIR/" || fail swap
+
+healthy() {
+  sleep 5
+  for s in $SERVICES; do systemctl is-active --quiet "$s" || { log "service $s is not active"; return 1; }; done
+  bash -c "$HEALTH" >/dev/null 2>&1 || { log "health check failed"; return 1; }
+}
+for s in $SERVICES; do systemctl restart "$s"; done
+if ! healthy; then
+  log "rolling back"
+  rsync -a --delete "$PREV/" "$LIVE_DIR/"
+  for s in $SERVICES; do systemctl restart "$s"; done
+  if healthy; then log "rolled back to ${CUR:0:12}"; else log "!!! ROLLBACK ALSO UNHEALTHY - needs attention"; fi
+  echo "$NEW" > "$STATE/$NAME.failed"; exit 1
+fi
+
+echo "$NEW" > "$STATE/$NAME.deployed"; rm -f "$STATE/$NAME.failed"
+log "DEPLOYED ${NEW:0:12}: $SUBJECT"
+# Unit files are never installed automatically (they run as root); flag drift instead.
+for u in $UNIT_FILES; do
+  cmp -s "$LIVE_DIR/$u" "/etc/systemd/system/$(basename "$u")" || log "NOTE: $u differs from the installed unit; install it by hand (see CONVENTIONS.md)"
+done
+as_deploy rm -rf "$BUILD"
+exit 0
