@@ -60,7 +60,15 @@ const json = (r) => {
   }
 };
 
-const read = async (p) => (await call('read_note', { path: p })).text;
+// Compare note bodies only: the response also carries access counters that change on every read.
+const read = async (p) => {
+  const t = (await call('read_note', { path: p })).text;
+  try {
+    return JSON.parse(t).content ?? t;
+  } catch {
+    return t;
+  }
+};
 
 async function main() {
   console.log(`\n=== patch_note / get_backlinks / link-aware move: ${URL_} ===\n`);
