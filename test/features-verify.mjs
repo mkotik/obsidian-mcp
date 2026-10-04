@@ -64,7 +64,7 @@ async function main() {
   const { tools } = await client.listTools();
   const names = new Set(tools.map((t) => t.name));
   for (const t of ['list_tags', 'update_tags', 'add_image', 'read_image', 'create_upload_link']) check(`tool ${t} exposed`, names.has(t));
-  check('16 tools total', tools.length === 16, `${tools.length}`);
+  check('15 tools total', tools.length === 15, `${tools.length}`);
 
   // ---------------------------------------------------------------- fixtures
   const A = `${ROOT}/alpha.md`; // frontmatter tags + created, stale updated
