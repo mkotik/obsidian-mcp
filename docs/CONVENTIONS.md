@@ -222,9 +222,38 @@ every request. If built, curate rather than concatenate.
 
 ### Deployment
 
-There are no git credentials on the host. Deployment is: edit locally → `scp` →
-`npm ci && npm run build` → `systemctl restart` (and re-install the unit file when it
-changed — v1.1 added `StateDirectory=obsidian-mcp`). GitHub is updated separately through the
-web UI, and file hashes are compared across local, host, and GitHub to confirm
-the three copies match. A deploy key would remove this friction and is the
-obvious next improvement.
+**Push to `main` and it deploys.** Each repo on the host has an
+`auto-deploy@<name>.timer` that checks GitHub every 3 minutes. Files live in
+[`deploy/auto-deploy/`](../deploy/auto-deploy/) and are installed at
+`/usr/local/sbin/auto-deploy`, `/etc/auto-deploy/<name>.conf`, and
+`/etc/systemd/system/auto-deploy@.{service,timer}`.
+
+When `main` moves, `auto-deploy <name>`:
+
+1. fetches as the unprivileged `deploy` user over a **read-only deploy key**
+   (one per repo, `~deploy/.ssh/`, GitHub host key pinned to its published
+   fingerprint) — the host never holds credentials that can write to GitHub;
+2. exports the commit to a scratch dir and runs `npm ci`, `npm run build`, and
+   the repo's tests there, still as `deploy`, so dependency install scripts
+   never run as root;
+3. snapshots the live directory, rsyncs the build in, restarts the services in
+   order, and health-checks them (obsidian: unauthenticated `POST /mcp` → 401;
+   imessage: `/health` on 3100 and 3200);
+4. on any failure **rolls back** to the snapshot, records the commit as failed so
+   it is not retried every 3 minutes, and exits non-zero. A later commit, or
+   `sudo FORCE=1 auto-deploy <name>`, tries again.
+
+Unit files are **never** installed automatically — they run as root and carry
+the hardening, so a change to one is flagged in the log (`NOTE: … differs from
+the installed unit`) and installed by hand. Rollback restores code, not the
+database: an imessage commit that adds a migration is applied by
+`imessage-ingest` on start and stays applied.
+
+```bash
+journalctl -u 'auto-deploy@*' -n 50 --no-pager      # what deployed, what failed
+systemctl list-timers 'auto-deploy@*'
+sudo cat /var/lib/auto-deploy/<name>.deployed        # live commit
+sudo FORCE=1 /usr/local/sbin/auto-deploy <name>      # deploy now / retry a failed commit
+```
+
+GitHub is updated through the web UI (no write credentials anywhere on the host).
