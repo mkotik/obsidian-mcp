@@ -103,9 +103,14 @@ service; a single weak tenant compromises the host.
    arrives through the tunnel's outbound connection or not at all.
 3. **Origin re-validates the Access JWT.** Never trust that a request arrived via
    Cloudflare. There is no localhost bypass — an unauthenticated request from the
-   box itself must still get 401.
+   box itself must still get 401. **One documented exception:** obsidian's
+   `/drop/<token>` presigned image-upload path (see the obsidian README, *Drop
+   URLs*). Any new exception must be a presigned, single-use, short-lived,
+   write-only URL minted through an authenticated call, and be written up here.
 4. **One Access application per hostname, policy `owner-only`.** Never a broad
-   rule ("Everyone", "emails ending in…").
+   rule ("Everyone", "emails ending in…"). The only exception is the
+   path-scoped `obsidian-drop` app (`obsidian.deangoldsteen.com/drop`, Bypass /
+   Everyone) that fronts the presigned path in rule 3.
 5. **Never log** note or message contents, tokens, JWTs, cookies, or the owner's
    email. Permitted vocabulary: `Authentication succeeded`,
    `Authentication rejected: missing token`, `Authentication rejected: invalid token`.
@@ -118,8 +123,7 @@ service; a single weak tenant compromises the host.
 8. **No secrets in the repo.** Scan before every commit. The tunnel token, SSH
    keys, and any object-storage credentials live only on the host, mode 0600.
    Service secrets go in `/etc/<service>/` (root, 0600) and reach the process
-   through systemd `LoadCredential=`, never `Environment=` (the obsidian
-   inbox token is the reference: `/etc/obsidian-mcp/inbox-token`).
+   through systemd `LoadCredential=`, never `Environment=`.
 
 Non-secret and safe to commit: the Zero Trust team domain, the Access AUD tag,
 hostnames, ports.
@@ -191,7 +195,7 @@ routable while Access is not in front of it:
 | Obsidian MCP | `obsidian.deangoldsteen.com` → `127.0.0.1:3000` |
 | iMessage ingest | `imessage-ingest.deangoldsteen.com` → `127.0.0.1:3100` |
 | iMessage MCP | `imessage.deangoldsteen.com` → `127.0.0.1:3200` |
-| Access apps | `obsidian-mcp` and `imessage-mcp` (`owner-only`); `imessage-ingest` (service token) |
+| Access apps | `obsidian-mcp` and `imessage-mcp` (`owner-only`); `imessage-ingest` (service token); `obsidian-drop` (path `/drop`, Bypass, presigned uploads) |
 
 ### Shared code is still not extracted
 
