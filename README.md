@@ -29,13 +29,13 @@ Two decisions shape the whole implementation:
 
 ## Tools
 
-Fourteen tools:
+Fifteen tools:
 
 | Tool | Input | Behavior |
 |---|---|---|
-| `list_notes` | `directory?`, `tags?`, `modified_after?`/`_before?`, `created_after?`/`_before?`, `sort?`, `limit?` | Lists `.md` notes with created/modified dates and tags, **most recently changed first** |
-| `read_note` | `path`, `include_images?` | Reads one `.md` note plus its dates and tags; optionally returns the images it embeds |
-| `search_notes` | `query`, same filters as `list_notes`, `sort?`, `limit?` | Literal text search over body, file name, and tags; **ranked by relevance weighted toward recent edits** |
+| `list_notes` | `directory?`, `tags?`, `modified_after?`/`_before?`, `created_after?`/`_before?`, `accessed_after?`/`_before?`, `touched_after?`/`_before?`, `sort?`, `limit?` | Lists `.md` notes with created/modified dates, access stats and tags, **most recently changed first**; also sorts by `accessed`, `frequency` (most used) or `stale` (longest untouched) |
+| `read_note` | `path`, `include_images?` | Reads one `.md` note plus its dates, tags and access stats (and counts the read); optionally returns the images it embeds |
+| `search_notes` | `query`, same filters as `list_notes`, `sort?`, `limit?` | Literal text search over body, file name, and tags; **ranked by relevance weighted toward recent edits and frequent use** |
 | `write_note` | `path`, `content`, `stamp_dates?` | Creates or overwrites a `.md` note, creating parent dirs; keeps `created:`/`updated:` current |
 | `append_note` | `path`, `content`, `create_if_missing?`, `stamp_dates?` | Appends UTF-8 text to a `.md` note |
 | `patch_note` | `path`, `old_text`, `new_text`, `expected_matches?`, `stamp_dates?` | Replaces an exact snippet in place; refuses to write if the anchor is missing or ambiguous |
@@ -89,11 +89,54 @@ used as an upper bound includes that whole day. Responses include `now` so "this
 is unambiguous to the model.
 
 **Ranking.** `list_notes` defaults to most-recently-modified first. `search_notes`
-scores each hit as *relevance × recency*: relevance is `3` for a file-name hit, `2` for a
-tag hit, plus `log2(1 + body matches)`; recency is `0.4 + 0.6 × 0.5^(age / half-life)`
-with a 30-day half-life (`RECENCY_HALF_LIFE_DAYS`). A note edited today gets the full
-weight, a note untouched for months keeps 40%, so recent work rises to the top but a
-much stronger match on an old note still wins. `sort: "modified" | "created"` overrides it.
+scores each hit as *relevance × activity*: relevance is `3` for a file-name hit, `2` for a
+tag hit, plus `log2(1 + body matches)`; activity is
+`0.3 + 0.4 × recency + 0.3 × frequency`, where recency is `0.5^(age / 30 days)`
+(`RECENCY_HALF_LIFE_DAYS`) since the last change and frequency is the decayed access
+score described under **Access frequency**. Both decay, so a note opened weekly for
+months (~0.47) outranks one written once in April and never reopened (~0.30), recent
+work rises to the top, and a much stronger match on an old note still wins.
+`sort: "modified" | "created"` overrides it.
+
+## Access frequency
+
+The server records every time a note is **read** (`read_note`) or **edited** (`write_note`,
+`append_note`, `patch_note`, image embeds) through it, per path, in
+`STATE_DIR/access.json` (mode 0600; paths, timestamps and counts only — never content).
+List, search and read results carry:
+
+| Field | Meaning |
+|---|---|
+| `last_accessed` | ISO time of the last read or edit through the server, `null` if never |
+| `access_30d` | reads + edits in the last 30 days |
+| `access_total` | lifetime reads + edits since tracking began |
+
+`read_note` additionally returns `access.reads`, `edits`, `search_hits` and `first_accessed`.
+
+**Frequency.** Daily counts are kept for 90 days. The score is
+`Σ count_d × 0.5^(days_ago / 14)` (`FREQUENCY_HALF_LIFE_DAYS`), squashed to
+`1 − e^(−score/3)` so it saturates: one read today ≈ 0.28, weekly use ≈ 0.55, daily ≈ 0.99.
+
+**Not counted:** being returned by `search_notes` (tallied as `search_hits` for analytics,
+but kept out of ranking so results cannot reinforce themselves), `update_tags` (metadata
+only — bulk tagging should not make every note look used), and link rewrites by
+`move_note`. Moves and soft deletes carry a note's history with it, so a rename or a
+trash-and-restore keeps it; trashed entries are dropped after 90 days.
+
+**Cheap queries this enables** (all `list_notes`, no reads needed):
+
+- what did I touch this week → `touched_after: "7d"` (changed *or* accessed)
+- oldest untouched note → `sort: "stale", limit: 1` (oldest of last change and last access)
+- top 20 most-accessed → `sort: "frequency", limit: 20`
+- recently used → `sort: "accessed"`; notes not used in 3 months → `touched_before: "3m"`
+
+**Scope.** Only activity through this server is visible — an LLM reading or writing a
+note. Opening a note in the Obsidian app on a phone or laptop is not seen by the server.
+
+**Backfill.** Every `read_note`/write call has always been logged with its path, so past
+activity can be replayed once: stop the service, then
+`journalctl -u obsidian-mcp -o cat --no-pager | STATE_DIR=/var/lib/obsidian-mcp VAULT_ROOT=… node scripts/backfill-access.mjs`
+(`DRY_RUN=1` to preview). Moves are replayed in order; paths that no longer exist are dropped.
 
 **Stamping.** The write tools keep frontmatter dates current: a note gets `created:`
 if it has none (the existing creation time, never "now" for an old note) and `updated:`
@@ -319,8 +362,9 @@ text search would miss — a bare `[[Note]]`, a path-form link, and an aliased
 | `CF_ACCESS_AUD` | *required* — the Access application's 64-char AUD tag |
 | `MCP_PUBLIC_HOSTNAME` | optional — public hostname(s) for the Host/Origin allowlist; the first is also the base URL of upload links |
 | `NOTE_TIMEZONE` | `America/New_York` — how dates are read from and written to frontmatter |
-| `STATE_DIR` | `$STATE_DIRECTORY` (systemd) — where the created-date index is kept; unset means memory only |
+| `STATE_DIR` | `$STATE_DIRECTORY` (systemd) — where the created-date index and access stats are kept; unset means memory only |
 | `RECENCY_HALF_LIFE_DAYS` | `30` — how fast search's recency boost decays |
+| `FREQUENCY_HALF_LIFE_DAYS` | `14` — how fast a read/edit's contribution to the frequency score decays |
 | `STAMP_DATES` | `true` — set `false` to stop write tools maintaining `created:`/`updated:` |
 | `ATTACHMENTS_DIR` | Obsidian's `attachmentFolderPath`, else `attachments` |
 
@@ -422,12 +466,15 @@ src/edit.ts        date stamping and tag edits built on frontmatter.ts
 src/tags.ts        Obsidian tag extraction, normalisation, nested matching
 src/images.ts      image detection, safe names, fenced https download, upload pages
 src/access.ts      Cloudflare Access JWT verification (JWKS, issuer, audience, expiry)
+src/activity.ts    per-note access tracking: last accessed, 30-day counts, decayed frequency
+scripts/backfill-access.mjs  one-time replay of past reads/edits from the service log
 src/server.ts      MCP server, tool definitions, limits, logging, authenticated HTTP mount
 test/mcp-verify.mjs    full MCP client suite (functional + sandbox attacks)
 test/access-verify.mjs authentication suite (missing/malformed/forged/expired/wrong-aud)
 test/tools-verify.mjs  delete/move suite (trash, restore, folder moves, 18 sandbox cases)
 test/edit-verify.mjs   patch/backlinks/link-rewrite suite
 test/features-verify.mjs dates/ranking/stamping/tags/images suite
+test/activity-verify.mjs access tracking suite (tracker unit tests + sorts/filters/ranking/moves)
 test/drop-verify.mjs   presigned /drop/ upload suite (curl, no JWT, single use, isolation from /upload/)
 test/postcheck.mjs     short re-check against a running hardened service
 obsidian-mcp.service   systemd unit

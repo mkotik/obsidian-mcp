@@ -1,6 +1,6 @@
 {
   "name": "obsidian-mcp",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "MCP server exposing safe read/write access to an Obsidian vault, protected by Cloudflare Access",
   "type": "module",
   "private": true,
@@ -13,7 +13,8 @@
     "tools-verify": "node test/tools-verify.mjs",
     "edit-verify": "node test/edit-verify.mjs",
     "features-verify": "node test/features-verify.mjs",
-    "drop-verify": "node test/drop-verify.mjs"
+    "drop-verify": "node test/drop-verify.mjs",
+    "activity-verify": "node test/activity-verify.mjs"
   },
   "keywords": [
     "mcp",
