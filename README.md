@@ -46,9 +46,11 @@ Fourteen tools:
 | `update_tags` | `path`, `add?`, `remove?`, `preserve_modified?` | Adds/removes frontmatter tags without touching anything else in the note |
 | `add_image` | `url` or `data_base64`, `filename?`, `folder?`, `note_path?`, `after_text?`, `width?`, `create_note?` | Saves an image into the vault and optionally embeds it as `![[...]]` |
 | `read_image` | `path` | Returns a vault image as image content so the model can see it |
-| `create_upload_link` | `note_path?`, `folder?`, `create_note?`, `expires_minutes?` | Mints a single-use upload page for images from a phone or computer |
+| `create_upload_link` | `note_path?`, `folder?`, `create_note?`, `expires_minutes?` | Mints a single-use upload page for images from a phone or computer (fallback) |
+| `start_image_upload` | — | Step 1 for a chat-attached image: returns an upload id and a push script for the model's code sandbox |
+| `import_uploaded_images` | `upload_id`, `note_path?`, `after_text?`, `width?`, `filename?`, `folder?`, `create_note?` | Step 2: pulls the pushed images into the vault, embeds them, and clears them from the relay repo |
 
-Deliberately **not** exposed: shell/command execution, arbitrary filesystem reads, package installation, general network requests, or direct `ob` CLI invocation. The one outbound request the server can make is `add_image`'s https image download, which is fenced (see **Images**).
+Deliberately **not** exposed: shell/command execution, arbitrary filesystem reads, package installation, general network requests, or direct `ob` CLI invocation. The outbound requests the server can make are `add_image`'s https image download, which is fenced (see **Images**), and calls to `api.github.com` for the one inbox repo.
 
 `move_note` is what makes the vault reorganisable: it accepts a directory on both
 sides, so `move_note from="raw/journal" to="active/journal"` relocates the folder and
@@ -133,13 +135,21 @@ matches its nested children (`project` matches `project/alpha`).
 
 ## Images
 
-An MCP client can only pass a tool text arguments, so there are three ways in:
+An MCP client can only pass a tool text arguments, so there are four ways in:
 
 | Route | Use it for |
 |---|---|
 | `add_image` with `url` | An image on the web. The server downloads it. |
 | `add_image` with `data_base64` | Small images the model genuinely has bytes for (a generated chart). Impractical for photos — the model would have to emit megabytes of base64. |
-| `create_upload_link` | **An image attached in chat, or on your phone.** The model can see a chat attachment but cannot hand its bytes to a tool, so it gives you a single-use link instead; you open it, pick images, and they land in the vault, embedded in the note. |
+| `start_image_upload` → `import_uploaded_images` | **An image attached in chat (the default).** Claude.ai never hands attachment bytes to a tool, but its code sandbox has the file and can reach github.com. The sandbox runs the returned script to `git push` the file to a private relay repo; the server then downloads it over the GitHub API, saves and embeds it, and rewrites the relay branch as a single parentless commit without it, so photos do not linger in history. Uploads abandoned for 24 h are swept on the next import. |
+| `create_upload_link` | **Fallback** (no code execution, or the push fails): a single-use page where you pick images yourself. |
+
+### Inbox relay setup
+
+- Private repo (here `mkotik/vault-inbox`) with a README on `main`.
+- A fine-grained personal access token limited to **that repo only**, permission *Contents: read and write*. One token serves both sides: the server hands it to the model inside the push script (it is not stored in Claude), and uses it itself to download and clean up. The blast radius is one empty repo.
+- On the host: `sudo install -d -m 700 /etc/obsidian-mcp` and `sudo install -m 600 -o root -g root token /etc/obsidian-mcp/inbox-token`. The unit passes it in with `LoadCredential=`; the process reads `$CREDENTIALS_DIRECTORY/inbox-token` on every call, so rotating it needs no restart. It is never logged.
+- The token expires **2027-10-03** — rotate before then (GitHub → Settings → Developer settings → Fine-grained tokens → vault-inbox relay → Regenerate), then replace the file.
 
 Images are saved under the attachments folder (`ATTACHMENTS_DIR`, else Obsidian's
 `attachmentFolderPath` setting, else `attachments/`) and embedded with an unambiguous
@@ -303,6 +313,10 @@ text search would miss — a bare `[[Note]]`, a path-form link, and an aliased
 | `RECENCY_HALF_LIFE_DAYS` | `30` — how fast search's recency boost decays |
 | `STAMP_DATES` | `true` — set `false` to stop write tools maintaining `created:`/`updated:` |
 | `ATTACHMENTS_DIR` | Obsidian's `attachmentFolderPath`, else `attachments` |
+| `INBOX_REPO` | unset (inbox tools disabled) — `owner/name` of the relay repo |
+| `INBOX_TOKEN_FILE` | `$CREDENTIALS_DIRECTORY/inbox-token` — file holding the relay token |
+| `INBOX_BRANCH` | `main` |
+| `INBOX_STALE_HOURS` | `24` — abandoned uploads older than this are removed on the next import |
 
 `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` are **not secrets** (the AUD tag is a public
 identifier; the trust anchor is Cloudflare's signing key, fetched at runtime). They are

@@ -22,6 +22,13 @@ Environment=CF_ACCESS_TEAM_DOMAIN=https://mkotik.cloudflareaccess.com
 Environment=CF_ACCESS_AUD=c89ed5c74cbe54e3fadfa587a27cba6bb5bea00439a66c0f46199b9c041dd79d
 Environment=MCP_PUBLIC_HOSTNAME=obsidian.deangoldsteen.com
 
+# --- Image inbox relay (start_image_upload / import_uploaded_images). The token
+# --- is a fine-grained GitHub PAT limited to this one repo (Contents: read and
+# --- write). It lives root-owned 0600 outside the repo and reaches the process
+# --- only through systemd credentials ($CREDENTIALS_DIRECTORY/inbox-token).
+Environment=INBOX_REPO=mkotik/vault-inbox
+LoadCredential=inbox-token:/etc/obsidian-mcp/inbox-token
+
 ExecStart=/usr/bin/node /home/ubuntu/obsidian-mcp/dist/server.js
 Restart=on-failure
 RestartSec=5
