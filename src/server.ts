@@ -27,18 +27,18 @@ import {
   messagePage,
 } from './images.js';
 import type { ImageType } from './images.js';
-import { Inbox, InboxError, inboxConfigFromEnv, newUploadId, isUploadId } from './inbox.js';
 import { createAccessVerifier, AccessConfigError } from './access.js';
 import type { AccessVerifier } from './access.js';
 
 const SERVER_NAME = 'obsidian-vault';
-const SERVER_VERSION = '1.2.1';
+const SERVER_VERSION = '1.3.0';
 
 const VAULT_ROOT = process.env.VAULT_ROOT ?? '/home/ubuntu/vaults/main';
 const BIND_HOST = process.env.MCP_HOST ?? '127.0.0.1';
 const BIND_PORT = Number(process.env.MCP_PORT ?? 3000);
 const MCP_PATH = '/mcp';
 const UPLOAD_PATH = '/upload/';
+const DROP_PATH = '/drop/';
 
 /** Timezone used to interpret and write note dates (`created: YYYY-MM-DD`). */
 const TIME_ZONE = process.env.NOTE_TIMEZONE ?? 'America/New_York';
@@ -108,6 +108,8 @@ const LIMITS = {
   uploadLinkMinutesDefault: 30,
   uploadLinkMinutesMax: 24 * 60,
   uploadLinksActive: 20,
+  dropMinutes: 15, // lifetime of a start_image_upload drop URL
+  dropsActive: 20,
 } as const;
 
 const vault = await Vault.open(VAULT_ROOT);
@@ -117,9 +119,6 @@ const noteIndex = await NoteIndex.open({
   stateDir: STATE_DIR,
   maxFileBytes: LIMITS.searchFileBytes,
 });
-
-/** GitHub inbox relay for chat-attached images (see inbox.ts). */
-const inbox = new Inbox(inboxConfigFromEnv(process.env));
 
 /** Public base URL for upload links, from the first published hostname. */
 const PUBLIC_BASE_URL = PUBLIC_HOSTNAMES.length > 0 ? `https://${PUBLIC_HOSTNAMES[0]}` : null;
@@ -152,7 +151,7 @@ async function guard(tool: string, body: () => Promise<ToolResult>): Promise<Too
   try {
     return await body();
   } catch (err) {
-    if (err instanceof VaultPathError || err instanceof FetchImageError || err instanceof InboxError) {
+    if (err instanceof VaultPathError || err instanceof FetchImageError) {
       log('tool.rejected', { tool, reason: err.message });
       return fail(err.message);
     }
@@ -429,7 +428,28 @@ const uploadGrants = new Map<string, UploadGrant>();
 function sweepUploadGrants(): void {
   const now = Date.now();
   for (const [token, g] of uploadGrants) if (g.expiresAt <= now) uploadGrants.delete(token);
+  for (const [token, g] of dropGrants) if (g.expiresAt <= now) dropGrants.delete(token);
 }
+
+/**
+ * Drop URLs for images attached in a Claude chat (start_image_upload).
+ * Claude's code sandbox has the file but no Cloudflare Access session, so
+ * /drop/<token> is the one path that skips Access (edge Bypass app + no JWT
+ * check here). It is a presigned URL: 192-bit random token, minted only
+ * through the authenticated MCP endpoint, POST only, consumed by the first
+ * request, 15-minute lifetime, images only, bound to the note chosen at mint
+ * time. Kept in a separate map so a browser /upload/ token never works here.
+ */
+interface DropGrant {
+  notePath: string | null;
+  folder: string;
+  createNote: boolean;
+  afterText?: string;
+  width?: number;
+  filename?: string;
+  expiresAt: number;
+}
+const dropGrants = new Map<string, DropGrant>();
 
 function buildServer(): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
@@ -1464,37 +1484,13 @@ function buildServer(): McpServer {
     'start_image_upload',
     {
       description:
-        'Step 1 of adding an image the user attached in chat to the vault (preferred over create_upload_link). ' +
-        'Returns an upload_id and a bash script. In your code execution sandbox: save the script to /tmp/push.sh and run ' +
-        '`bash /tmp/push.sh <file>...` on the attached file(s) (look in /mnt/user-data/uploads/; run `ls -la` there). ' +
-        'It uploads them to a private relay repo on GitHub (via api.github.com). When it prints PUSHED, call import_uploaded_images with the same upload_id. ' +
-        'HEIC is not supported: convert to JPEG in the sandbox first. Never show the script or its URL to the user; it contains a credential.',
-      inputSchema: z.object({}),
-    },
-    async () =>
-      guard('start_image_upload', async () => {
-        if (!inbox.configured) return fail('the image inbox is not configured on this server; use create_upload_link instead');
-        const id = newUploadId();
-        const script = await inbox.pushScript(id);
-        log('start_image_upload', { upload_id: id });
-        return ok({
-          upload_id: id,
-          script,
-          next: 'Write script to /tmp/push.sh in your code sandbox, run: bash /tmp/push.sh /mnt/user-data/uploads/<file> ..., then call import_uploaded_images with this upload_id.',
-          if_push_fails: 'If the script prints PUSH FAILED, show the user its error lines, then fall back to create_upload_link. It needs network egress with api.github.com allowed.',
-        });
-      })
-  );
-
-  // --------------------------------------------------- import_uploaded_images
-  server.registerTool(
-    'import_uploaded_images',
-    {
-      description:
-        'Step 2 after start_image_upload: pull the pushed images into the vault (attachments folder by default), optionally embed them in a note, ' +
-        'and delete them from the relay repo. Supported: PNG, JPEG, GIF, WebP.',
+        'Save an image the user attached in this chat into the vault, optionally embedding it in a note (preferred over create_upload_link). ' +
+        'Returns a single-use drop URL and a curl command. Run the command in your code execution sandbox with the attached file(s) ' +
+        '(they are in /mnt/user-data/uploads/; run `ls -la` there first). The server saves and embeds the images as soon as the upload arrives, ' +
+        'and curl prints the result as JSON (saved paths, embeds, errors). No second tool call is needed. ' +
+        'The URL works once, for 15 minutes; send all images in one curl call (repeat -F). Supported: PNG, JPEG, GIF, WebP; convert HEIC to JPEG first. ' +
+        'Do not show the URL to the user.',
       inputSchema: z.object({
-        upload_id: z.string().max(64).describe('The upload_id returned by start_image_upload.'),
         note_path: z.string().max(1024).optional().describe('Vault-relative .md note to embed the images in.'),
         after_text: z
           .string()
@@ -1507,67 +1503,49 @@ function buildServer(): McpServer {
         create_note: z.boolean().optional().describe('Create note_path if it does not exist. Defaults to false.'),
       }),
     },
-    async ({ upload_id, note_path, after_text, width, filename, folder, create_note }) =>
-      guard('import_uploaded_images', async () => {
-        if (!inbox.configured) return fail('the image inbox is not configured on this server');
-        if (!isUploadId(upload_id)) return fail('upload_id is not valid; call start_image_upload first');
-        if (note_path !== undefined) await vault.resolve(note_path, { requireMarkdown: true });
+    async ({ note_path, after_text, width, filename, folder, create_note }) =>
+      guard('start_image_upload', async () => {
+        if (!PUBLIC_BASE_URL) return fail('direct upload needs MCP_PUBLIC_HOSTNAME to be configured on the server');
+        sweepUploadGrants();
+        if (dropGrants.size >= LIMITS.dropsActive) return fail('too many pending uploads; wait a few minutes');
 
-        const files = await inbox.listUpload(upload_id);
-        if (files.length === 0) return fail('nothing has been pushed for this upload_id yet (did the push script print PUSHED?)');
-        if (files.length > 20) return fail('too many files in one upload (max 20)');
-
-        const dest = folder ?? (await defaultAttachmentFolder(note_path ?? null));
-        const saved: Array<{ path: string; bytes: number; mime: string }> = [];
-        const errors: string[] = [];
-        for (const f of files) {
-          try {
-            if (f.size > LIMITS.imageBytes) throw new InboxError(`${f.name} is larger than the ${LIMITS.imageBytes / 1048576} MB limit`);
-            const data = await inbox.download(f.path, LIMITS.imageBytes);
-            const type = detectImage(data);
-            if (!type) {
-              errors.push(`${f.name}: ${looksLikeHeic(data) ? 'HEIC is not supported; convert to JPEG and upload again' : 'not a PNG, JPEG, GIF, or WebP image'}`);
-              continue;
+        let noteRel: string | null = null;
+        if (note_path !== undefined) {
+          const note = await vault.resolve(note_path, { requireMarkdown: true });
+          noteRel = note.rel;
+          if (create_note !== true) {
+            try {
+              await stat(note.abs);
+            } catch {
+              return fail('note_path does not exist (pass create_note: true to create it)');
             }
-            const stem = filename !== undefined && filename.trim() !== '' ? filename : f.name.replace(/\.[A-Za-z0-9]{1,5}$/, '');
-            const s = await saveImage(data, type, { filename: stem.length >= 1 ? stem : undefined, folder: dest });
-            saved.push({ path: s.rel, bytes: s.bytes, mime: type.mime });
-          } catch (err) {
-            if (err instanceof InboxError || err instanceof VaultPathError) errors.push(`${f.name}: ${err.message}`);
-            else throw err;
           }
         }
+        const dest = folder ?? (await defaultAttachmentFolder(noteRel));
+        const dir = await vault.resolve(dest === '' ? '.' : dest, { allowRoot: true });
 
-        let embedded: Awaited<ReturnType<typeof embedInNote>> | null = null;
-        let embedError: string | undefined;
-        const embeds = saved.map((s) => embedFor(s.path, width));
-        if (note_path !== undefined && embeds.length > 0) {
-          try {
-            embedded = await embedInNote(note_path, embeds, { afterText: after_text, create: create_note === true, stamp: STAMP_DATES_DEFAULT });
-          } catch (err) {
-            embedError = err instanceof VaultPathError ? err.message : 'could not edit the note';
-          }
-        }
-
-        // Remove the upload from the relay repo whatever happened; the vault now holds the copies.
-        let cleanup: string;
-        try {
-          const r = await inbox.purge(new Set(files.map((f) => f.path)));
-          cleanup = `removed ${r.removed} file(s) from the relay repo`;
-        } catch (err) {
-          cleanup = `could not clean the relay repo: ${err instanceof InboxError ? err.message : 'error'}`;
-        }
-
-        log('import_uploaded_images', { upload_id, saved: saved.length, failed: errors.length, embedded: embedded !== null });
-        if (saved.length === 0) return fail(`no images imported. ${errors.join('; ')}`);
+        const token = randomBytes(24).toString('base64url');
+        const expiresAt = Date.now() + LIMITS.dropMinutes * 60_000;
+        dropGrants.set(token, {
+          notePath: noteRel,
+          folder: dir.rel,
+          createNote: create_note === true,
+          afterText: after_text,
+          width,
+          filename: filename !== undefined && filename.trim() !== '' ? filename : undefined,
+          expiresAt,
+        });
+        const url = `${PUBLIC_BASE_URL}${DROP_PATH}${token}`;
+        log('start_image_upload', { note: noteRel ?? '-' });
         return ok({
-          images: saved,
-          embeds,
-          embedded: embedded !== null,
-          ...(embedded ? { note_path: embedded.path, note_created: embedded.created, dates_stamped: embedded.stamped } : {}),
-          ...(embedError ? { embed_error: embedError } : {}),
-          ...(errors.length ? { errors } : {}),
-          cleanup,
+          command: `curl -sS --max-time 300 -F "images=@/mnt/user-data/uploads/FILE" ${url}`,
+          url,
+          expires_at: formatIsoLocal(expiresAt, TIME_ZONE),
+          note_path: noteRel,
+          folder: dir.rel || '.',
+          how: 'Replace FILE with the attachment name (add another -F "images=@..." per extra image; quote paths with spaces). ' +
+            'The JSON reply lists saved images and embeds. On HTTP 404 the URL was used or expired: call start_image_upload again. ' +
+            'If the sandbox cannot reach the host (network egress off, or obsidian host not in the allowed domains), fall back to create_upload_link.',
         });
       })
   );
@@ -1653,6 +1631,112 @@ function byteLimit(max: number): Transform {
   });
 }
 
+/** Validate and store the `images` parts of an upload form. Shared by /upload and /drop. */
+async function saveFormImages(
+  files: File[],
+  folder: string,
+  filename?: string
+): Promise<{ saved: Array<{ path: string; bytes: number }>; errors: string[] }> {
+  const maxMb = Math.round(LIMITS.imageBytes / 1048576);
+  const saved: Array<{ path: string; bytes: number }> = [];
+  const errors: string[] = [];
+  for (const file of files.slice(0, LIMITS.uploadFilesMax)) {
+    const name = file.name || 'image';
+    if (file.size === 0) continue;
+    if (file.size > LIMITS.imageBytes) {
+      errors.push(`${name}: larger than ${maxMb} MB`);
+      continue;
+    }
+    const data = Buffer.from(await file.arrayBuffer());
+    const detected = detectImage(data);
+    if (!detected) {
+      errors.push(`${name}: ${looksLikeHeic(data) ? 'HEIC is not supported — choose "Most Compatible" in iPhone camera settings, or convert to JPEG' : 'not a PNG, JPEG, GIF, or WebP image'}`);
+      continue;
+    }
+    try {
+      const stem = filename ?? name.replace(/\.[A-Za-z0-9]{1,5}$/, '');
+      const stored = await saveImage(data, detected, { filename: stem || undefined, folder });
+      saved.push({ path: stored.rel, bytes: stored.bytes });
+    } catch (err) {
+      errors.push(`${name}: ${err instanceof VaultPathError ? err.message : 'could not be saved'}`);
+    }
+  }
+  if (files.length > LIMITS.uploadFilesMax) errors.push(`only the first ${LIMITS.uploadFilesMax} files were processed`);
+  if (files.length === 0) errors.push('no files were sent (use the form field name "images")');
+  return { saved, errors };
+}
+
+function sendJson(res: import('node:http').ServerResponse, status: number, body: unknown): void {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('cache-control', 'no-store');
+  res.setHeader('x-content-type-options', 'nosniff');
+  res.end(JSON.stringify(body, null, 2) + '\n');
+}
+
+/**
+ * POST /drop/<token>: unauthenticated by design (see DropGrant). The token is
+ * consumed before the body is read, so it can never be replayed, and an
+ * unknown token is rejected without reading the body.
+ */
+async function handleDrop(
+  req: import('node:http').IncomingMessage,
+  res: import('node:http').ServerResponse,
+  token: string
+): Promise<void> {
+  sweepUploadGrants();
+  const grant = req.method === 'POST' ? dropGrants.get(token) : undefined;
+  if (!grant) {
+    log('drop rejected', { reason: req.method === 'POST' ? 'unknown or expired token' : 'method' });
+    req.resume();
+    sendJson(res, 404, { error: 'not found: this drop URL is invalid, already used, or expired; call start_image_upload again' });
+    return;
+  }
+  dropGrants.delete(token); // single use, whatever happens next
+
+  const type = req.headers['content-type'] ?? '';
+  if (!/^multipart\/form-data;/i.test(type)) {
+    req.resume();
+    sendJson(res, 415, { error: 'expected multipart/form-data (curl -F "images=@file")' });
+    return;
+  }
+  const declared = Number(req.headers['content-length'] ?? 0);
+  if (declared > LIMITS.uploadRequestBytes) {
+    req.resume();
+    sendJson(res, 413, { error: `uploads are limited to ${LIMITS.uploadRequestBytes / 1048576} MB in total` });
+    return;
+  }
+  let form: FormData;
+  try {
+    const body = Readable.toWeb(req.pipe(byteLimit(LIMITS.uploadRequestBytes))) as ReadableStream<Uint8Array>;
+    form = await new Request('http://localhost/drop', { method: 'POST', headers: { 'content-type': type }, body, duplex: 'half' } as RequestInit).formData();
+  } catch {
+    sendJson(res, 400, { error: 'the upload could not be read (too large or malformed)' });
+    return;
+  }
+
+  const files = form.getAll('images').filter((v): v is File => typeof v !== 'string');
+  const { saved, errors } = await saveFormImages(files, grant.folder, grant.filename);
+  const embeds = saved.map((s) => embedFor(s.path, grant.width));
+  let embedded: Awaited<ReturnType<typeof embedInNote>> | null = null;
+  if (grant.notePath && embeds.length > 0) {
+    try {
+      embedded = await embedInNote(grant.notePath, embeds, { afterText: grant.afterText, create: grant.createNote, stamp: STAMP_DATES_DEFAULT });
+    } catch (err) {
+      errors.push(`images were saved but not embedded: ${err instanceof VaultPathError ? err.message : 'edit failed'}`);
+    }
+  }
+  log('drop', { saved: saved.length, rejected: errors.length, embedded: embedded !== null });
+  sendJson(res, saved.length > 0 ? 200 : 400, {
+    ok: saved.length > 0,
+    images: saved,
+    embeds,
+    embedded: embedded !== null,
+    ...(embedded ? { note_path: embedded.path, note_created: embedded.created } : {}),
+    ...(errors.length ? { errors } : {}),
+  });
+}
+
 async function handleUpload(
   req: import('node:http').IncomingMessage,
   res: import('node:http').ServerResponse,
@@ -1698,30 +1782,7 @@ async function handleUpload(
   }
 
   const files = form.getAll('images').filter((v): v is File => typeof v !== 'string');
-  const saved: Array<{ path: string; bytes: number }> = [];
-  const errors: string[] = [];
-  for (const file of files.slice(0, LIMITS.uploadFilesMax)) {
-    const name = file.name || 'image';
-    if (file.size === 0) continue;
-    if (file.size > LIMITS.imageBytes) {
-      errors.push(`${name}: larger than ${maxMb} MB`);
-      continue;
-    }
-    const data = Buffer.from(await file.arrayBuffer());
-    const detected = detectImage(data);
-    if (!detected) {
-      errors.push(`${name}: ${looksLikeHeic(data) ? 'HEIC is not supported — choose "Most Compatible" in iPhone camera settings, or share as JPEG' : 'not a PNG, JPEG, GIF, or WebP image'}`);
-      continue;
-    }
-    try {
-      const stored = await saveImage(data, detected, { filename: name, folder: grant.folder });
-      saved.push({ path: stored.rel, bytes: stored.bytes });
-    } catch (err) {
-      errors.push(`${name}: ${err instanceof VaultPathError ? err.message : 'could not be saved'}`);
-    }
-  }
-  if (files.length > LIMITS.uploadFilesMax) errors.push(`only the first ${LIMITS.uploadFilesMax} files were processed`);
-  if (files.length === 0) errors.push('no files were selected');
+  const { saved, errors } = await saveFormImages(files, grant.folder);
 
   let notePath: string | null = null;
   if (saved.length > 0) {
@@ -1748,6 +1809,17 @@ async function handleRequest(
   if (!validateHost(req, res) || !validateOrigin(req, res)) return;
 
   const url = req.url ?? '';
+  // Presigned drop URLs: the only path served without an Access JWT.
+  const dropMatch = /^\/drop\/([A-Za-z0-9_-]{32})$/.exec(url.split('?')[0]);
+  if (dropMatch) {
+    await handleDrop(req, res, dropMatch[1]);
+    return;
+  }
+  if (url.startsWith(DROP_PATH)) {
+    req.resume();
+    sendJson(res, 404, { error: 'not found' });
+    return;
+  }
   const uploadMatch = /^\/upload\/([A-Za-z0-9_-]{20,64})$/.exec(url.split('?')[0]);
   if (uploadMatch) {
     const auth = await accessVerifier.verify(req);
@@ -1799,7 +1871,7 @@ http.listen(BIND_PORT, BIND_HOST, () => {
     port: BIND_PORT,
     endpoint: `http://${BIND_HOST}:${BIND_PORT}${MCP_PATH}`,
     tools:
-      'list_notes,read_note,search_notes,write_note,append_note,patch_note,delete_note,move_note,get_backlinks,list_tags,update_tags,add_image,read_image,create_upload_link,start_image_upload,import_uploaded_images',
+      'list_notes,read_note,search_notes,write_note,append_note,patch_note,delete_note,move_note,get_backlinks,list_tags,update_tags,add_image,read_image,create_upload_link,start_image_upload',
     timezone: TIME_ZONE,
     created_index: noteIndex.persistent ? 'persistent' : 'memory-only',
     allowed_hostnames: allowedHostnames.join(','),
