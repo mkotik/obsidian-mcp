@@ -47,10 +47,9 @@ Fourteen tools:
 | `add_image` | `url` or `data_base64`, `filename?`, `folder?`, `note_path?`, `after_text?`, `width?`, `create_note?` | Saves an image into the vault and optionally embeds it as `![[...]]` |
 | `read_image` | `path` | Returns a vault image as image content so the model can see it |
 | `create_upload_link` | `note_path?`, `folder?`, `create_note?`, `expires_minutes?` | Mints a single-use upload page for images from a phone or computer (fallback) |
-| `start_image_upload` | — | Step 1 for a chat-attached image: returns an upload id and a push script for the model's code sandbox |
-| `import_uploaded_images` | `upload_id`, `note_path?`, `after_text?`, `width?`, `filename?`, `folder?`, `create_note?` | Step 2: pulls the pushed images into the vault, embeds them, and clears them from the relay repo |
+| `start_image_upload` | `note_path?`, `after_text?`, `width?`, `filename?`, `folder?`, `create_note?` | For a chat-attached image: mints a single-use 15-minute drop URL; the model's code sandbox `curl`s the file there and the server saves + embeds it |
 
-Deliberately **not** exposed: shell/command execution, arbitrary filesystem reads, package installation, general network requests, or direct `ob` CLI invocation. The outbound requests the server can make are `add_image`'s https image download, which is fenced (see **Images**), and calls to `api.github.com` for the one inbox repo.
+Deliberately **not** exposed: shell/command execution, arbitrary filesystem reads, package installation, general network requests, or direct `ob` CLI invocation. The only outbound request the server makes is `add_image`'s https image download, which is fenced (see **Images**).
 
 `move_note` is what makes the vault reorganisable: it accepts a directory on both
 sides, so `move_note from="raw/journal" to="active/journal"` relocates the folder and
@@ -141,15 +140,26 @@ An MCP client can only pass a tool text arguments, so there are four ways in:
 |---|---|
 | `add_image` with `url` | An image on the web. The server downloads it. |
 | `add_image` with `data_base64` | Small images the model genuinely has bytes for (a generated chart). Impractical for photos — the model would have to emit megabytes of base64. |
-| `start_image_upload` → `import_uploaded_images` | **An image attached in chat (the default).** Claude.ai never hands attachment bytes to a tool, but its code sandbox has the file. The sandbox runs the returned script, which uploads the file to a private relay repo through the GitHub contents API (`curl` PUT to `api.github.com`; `git push` is only a fallback, because Claude's sandbox git proxy refuses repos not attached to the chat); the server then downloads it over the GitHub API, saves and embeds it, and rewrites the relay branch as a single parentless commit without it, so photos do not linger in history. Uploads abandoned for 24 h are swept on the next import. Requires, in Claude Settings → Capabilities: code execution on, **Allow network egress** on, and `api.github.com` in the additional allowed domains. |
-| `create_upload_link` | **Fallback** (no code execution, or the push fails): a single-use page where you pick images yourself. |
+| `start_image_upload` | **An image attached in chat (the default).** Claude.ai never hands attachment bytes to a tool, but its code sandbox has the file and can make HTTPS requests to allowed domains. The tool mints a presigned URL, `https://<host>/drop/<token>`; the sandbox runs the returned `curl -F images=@<file> <url>`, and the server validates, saves, and embeds the images on arrival and answers with JSON. One tool call, one curl. |
+| `create_upload_link` | **Fallback** (no code execution, or the drop fails): a single-use page where you pick images yourself, behind the normal Access login. |
 
-### Inbox relay setup
+### Drop URLs (`/drop/<token>`)
 
-- Private repo (here `mkotik/vault-inbox`) with a README on `main`.
-- A fine-grained personal access token limited to **that repo only**, permission *Contents: read and write*. One token serves both sides: the server hands it to the model inside the push script (it is not stored in Claude), and uses it itself to download and clean up. The blast radius is one empty repo.
-- On the host: `sudo install -d -m 700 /etc/obsidian-mcp` and `sudo install -m 600 -o root -g root token /etc/obsidian-mcp/inbox-token`. The unit passes it in with `LoadCredential=`; the process reads `$CREDENTIALS_DIRECTORY/inbox-token` on every call, so rotating it needs no restart. It is never logged.
-- The token expires **2027-10-03** — rotate before then (GitHub → Settings → Developer settings → Fine-grained tokens → vault-inbox relay → Regenerate), then replace the file.
+`/drop/` is the **one path served without a Cloudflare Access JWT**, because Claude's sandbox has no Access session. It is a presigned URL, so the token is the credential:
+
+- 192-bit random token, minted only through the authenticated `/mcp` endpoint, held in memory (a restart revokes all).
+- **Single use:** consumed by the first POST, before the body is read, whether or not the upload succeeds. 15-minute lifetime. At most 20 outstanding.
+- POST `multipart/form-data` only; GET and unknown tokens get a bare 404 without the body being read. Images only (PNG, JPEG, GIF, WebP by magic bytes), same size caps as `/upload/`.
+- Bound at mint time to its destination note, folder, placement, and width; the uploader cannot choose a path.
+- Separate grant table from `/upload/`: a browser upload-link token never works on `/drop/`, and `/upload/` still requires Access.
+- Tokens are never logged.
+
+Setup:
+
+- **Cloudflare:** a separate Access application `obsidian-drop` with destination `obsidian.deangoldsteen.com/drop` and a single **Bypass / Everyone** policy. Path-specific apps take precedence over the hostname app, so everything else on the hostname (including `/dropx`) stays behind `owner-only`.
+- **Claude** (Settings → Capabilities): *Code execution and file creation* on, *Allow network egress* on, and the vault hostname (`obsidian.deangoldsteen.com`) in *Additional allowed domains*.
+
+Why not a GitHub relay: Claude's sandbox proxies github.com and api.github.com and refuses writes to any repo not attached to the chat, so a push-then-import design cannot work from there.
 
 Images are saved under the attachments folder (`ATTACHMENTS_DIR`, else Obsidian's
 `attachmentFolderPath` setting, else `attachments/`) and embedded with an unambiguous
@@ -313,10 +323,6 @@ text search would miss — a bare `[[Note]]`, a path-form link, and an aliased
 | `RECENCY_HALF_LIFE_DAYS` | `30` — how fast search's recency boost decays |
 | `STAMP_DATES` | `true` — set `false` to stop write tools maintaining `created:`/`updated:` |
 | `ATTACHMENTS_DIR` | Obsidian's `attachmentFolderPath`, else `attachments` |
-| `INBOX_REPO` | unset (inbox tools disabled) — `owner/name` of the relay repo |
-| `INBOX_TOKEN_FILE` | `$CREDENTIALS_DIRECTORY/inbox-token` — file holding the relay token |
-| `INBOX_BRANCH` | `main` |
-| `INBOX_STALE_HOURS` | `24` — abandoned uploads older than this are removed on the next import |
 
 `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` are **not secrets** (the AUD tag is a public
 identifier; the trust anchor is Cloudflare's signing key, fetched at runtime). They are
@@ -422,6 +428,7 @@ test/access-verify.mjs authentication suite (missing/malformed/forged/expired/wr
 test/tools-verify.mjs  delete/move suite (trash, restore, folder moves, 18 sandbox cases)
 test/edit-verify.mjs   patch/backlinks/link-rewrite suite
 test/features-verify.mjs dates/ranking/stamping/tags/images suite
+test/drop-verify.mjs   presigned /drop/ upload suite (curl, no JWT, single use, isolation from /upload/)
 test/postcheck.mjs     short re-check against a running hardened service
 obsidian-mcp.service   systemd unit
 ```
