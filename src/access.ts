@@ -134,6 +134,12 @@ export function createAccessVerifier(input: AccessConfigInput): AccessVerifier {
   }
 
   const issuer = normalizeIssuer(input.teamDomain);
+  const allowedServiceTokenIds = new Set(
+    (process.env.CF_ACCESS_SERVICE_TOKEN_IDS ?? '')
+      .split(',')
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0)
+  );
   const audience = normalizeAud(input.aud);
   const jwksUrl = `${issuer}/cdn-cgi/access/certs`;
 
@@ -171,11 +177,16 @@ export function createAccessVerifier(input: AccessConfigInput): AccessVerifier {
       // a token with no expiry must never be accepted.
       if (typeof payload.exp !== 'number') return { ok: false, reason: 'invalid token' };
 
-      // Our Access policy is identity-based, so a subject must be present.
-      // (Service-token requests carry `common_name` instead of `sub`; we do not
-      // use service tokens, so those are rejected here too.)
-      if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
-        return { ok: false, reason: 'invalid token' };
+      // Identity-based requests carry a non-empty `sub`. Service-token requests
+      // carry `common_name` (the token's client ID) and an empty `sub`; those are
+      // accepted ONLY if that client ID is in CF_ACCESS_SERVICE_TOKEN_IDS
+      // (comma-separated). Unset or empty means service tokens stay rejected.
+      const hasSub = typeof payload.sub === 'string' && payload.sub.length > 0;
+      if (!hasSub) {
+        const cn = payload.common_name;
+        if (typeof cn !== 'string' || cn.length === 0 || !allowedServiceTokenIds.has(cn)) {
+          return { ok: false, reason: 'invalid token' };
+        }
       }
 
       return { ok: true };
