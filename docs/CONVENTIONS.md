@@ -19,7 +19,7 @@ tenant (Obsidian), which stops making sense the moment there are two.
 | OCI instance | shared | `mcp-host` | `mcp-host` |
 | OS hostname | shared | `mcp-host` | `mcp-host` |
 | Cloudflare tunnel | shared | `personal-mcp` | `personal-mcp` |
-| Git repository | shared | `personal-mcp` | `personal-mcp` |
+| Git repository | shared | `obsidian-mcp` | `obsidian-mcp` |
 | Public hostname | per service | `<service>.deangoldsteen.com` | `obsidian.` |
 | Access application | per service | `<service>-mcp` | `obsidian-mcp` |
 | systemd unit | per service | `<service>-mcp.service` | `obsidian-mcp.service` |
@@ -74,7 +74,7 @@ Today the repo holds a single service at the root. When the **second** service
 lands, move to:
 
 ```
-personal-mcp/
+obsidian-mcp/
 ├── packages/core/          shared: Access JWT, bootstrap, logging, limits
 ├── services/obsidian/      vault tools
 ├── services/imessage/      message tools
