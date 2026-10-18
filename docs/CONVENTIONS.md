@@ -26,7 +26,7 @@ is still called `personal-mcp` and the auto-deploy instance is still
 | OS hostname | shared | `mcp-host` | `mcp-host` |
 | Cloudflare tunnel | shared | `personal-mcp` | `personal-mcp` |
 | Git repository | per project | `<project>-mcp` | `obsidian-mcp` |
-| Public hostname | per service | `<service>.deangoldsteen.com` | `obsidian.` |
+| Public hostname | per service | `<service>.example.com` | `obsidian.` |
 | Access application | per service | `<service>-mcp` | `obsidian-mcp` |
 | systemd unit | per service | `<service>-mcp.service` | `obsidian-mcp.service` |
 | Loopback port | per service | see registry below | 3000 |
@@ -35,20 +35,20 @@ is still called `personal-mcp` and the auto-deploy instance is still
 ### Why exactly one subdomain level
 
 Cloudflare Universal SSL (the free certificate) covers the apex and **one** level
-of subdomain only. `imessage.deangoldsteen.com` is covered;
-`imessage.mcp.deangoldsteen.com` is **not** and would serve an invalid
+of subdomain only. `imessage.example.com` is covered;
+`imessage.mcp.example.com` is **not** and would serve an invalid
 certificate unless you buy Advanced Certificate Manager.
 
 > Reference: <https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/limitations/>
 
-So: always `<service>.deangoldsteen.com`. Never a deeper name.
+So: always `<service>.example.com`. Never a deeper name.
 
 ### When a tenant needs two hostnames
 
 A tenant with two different *callers* gets two hostnames and two Access
 applications, because they need different authentication. iMessage is the first
-such case: `imessage.deangoldsteen.com` is owner-only Managed OAuth for me,
-while `imessage-ingest.deangoldsteen.com` is a machine endpoint gated by an
+such case: `imessage.example.com` is owner-only Managed OAuth for me,
+while `imessage-ingest.example.com` is a machine endpoint gated by an
 Access **service token** for the Mac sender.
 
 That produces one deliberate naming exception. The ingestion app is called
@@ -116,7 +116,7 @@ service; a single weak tenant compromises the host.
    write-only URL minted through an authenticated call, and be written up here.
 4. **One Access application per hostname, policy `owner-only`.** Never a broad
    rule ("Everyone", "emails ending in…"). The only exception is the
-   path-scoped `obsidian-drop` app (`obsidian.deangoldsteen.com/drop`, Bypass /
+   path-scoped `obsidian-drop` app (`obsidian.example.com/drop`, Bypass /
    Everyone) that fronts the presigned path in rule 3.
 5. **Never log** note or message contents, tokens, JWTs, cookies, or the owner's
    email. Permitted vocabulary: `Authentication succeeded`,
@@ -147,7 +147,7 @@ Checklist. Steps 1–3 are Cloudflare; 4–7 are the host.
 1. **Claim a port** in the registry above.
 2. **Publish the hostname.** Zero Trust → Networks → Tunnels & Mesh →
    `personal-mcp` → *Published application routes* → add
-   `<service>.deangoldsteen.com`, path empty, service `HTTP://127.0.0.1:<port>`.
+   `<service>.example.com`, path empty, service `HTTP://127.0.0.1:<port>`.
    DNS is created automatically.
 3. **Protect it before it serves anything.** Zero Trust → Access controls →
    Applications. Either add the hostname as a destination on an existing app, or
@@ -163,7 +163,7 @@ Checklist. Steps 1–3 are Cloudflare; 4–7 are the host.
 5. **Verify exposure** before declaring done:
    ```bash
    ss -ltnp | grep <port>          # must be 127.0.0.1, never 0.0.0.0
-   curl -o /dev/null -w '%{http_code}\n' https://<service>.deangoldsteen.com/mcp   # 401
+   curl -o /dev/null -w '%{http_code}\n' https://<service>.example.com/mcp   # 401
    curl -o /dev/null -w '%{http_code}\n' http://129.213.93.108:<port>/mcp          # 000
    ```
 6. **Test against the live authenticated endpoint**, not just local HTTP. A real
@@ -201,10 +201,10 @@ routable while Access is not in front of it:
 | | |
 |---|---|
 | Host | `mcp-host`, Oracle Always Free, ARM64, 1 vCPU, 5.8 GB RAM, 41 GB free |
-| Tunnel | `personal-mcp` (`2c2de917-4a72-4cb9-8df8-de4ce9d7f6d4`) |
-| Obsidian MCP | `obsidian.deangoldsteen.com` → `127.0.0.1:3000` |
-| iMessage ingest | `imessage-ingest.deangoldsteen.com` → `127.0.0.1:3100` |
-| iMessage MCP | `imessage.deangoldsteen.com` → `127.0.0.1:3200` |
+| Tunnel | `personal-mcp` (`<tunnel-id>`) |
+| Obsidian MCP | `obsidian.example.com` → `127.0.0.1:3000` |
+| iMessage ingest | `imessage-ingest.example.com` → `127.0.0.1:3100` |
+| iMessage MCP | `imessage.example.com` → `127.0.0.1:3200` |
 | Access apps | `obsidian-mcp` and `imessage-mcp` (`owner-only`); `imessage-ingest` (service token); `obsidian-drop` (path `/drop`, Bypass, presigned uploads) |
 
 ### Shared code is still not extracted
@@ -220,14 +220,14 @@ back-port the principal option to Obsidian and extract a genuinely shared
 package, or accept the divergence deliberately and write it down. Do not let a
 third copy drift silently.
 
-`mcp.deangoldsteen.com` was retired on 2026-08-29. It read like a generic
+`mcp.example.com` was retired on 2026-08-29. It read like a generic
 entry point but resolved to a single service, which would have been actively
 misleading once a second MCP existed. Deleting the tunnel route also removed
 its DNS record automatically.
 
 The name is now free. If a **gateway** MCP is ever built — one endpoint
 aggregating a curated subset of tools from every service, so a single connector
-serves all agents — `mcp.deangoldsteen.com` is the right name for it. Note the
+serves all agents — `mcp.example.com` is the right name for it. Note the
 tradeoff that argues against building one prematurely: every tool's schema is
 injected into the model's context on every request, and selection accuracy falls
 as near-duplicate tools accumulate. A gateway that re-exports the union of all
