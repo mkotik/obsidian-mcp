@@ -199,8 +199,8 @@ An MCP client can only pass a tool text arguments, so there are four ways in:
 
 Setup:
 
-- **Cloudflare:** a separate Access application `obsidian-drop` with destination `obsidian.deangoldsteen.com/drop` and a single **Bypass / Everyone** policy. Path-specific apps take precedence over the hostname app, so everything else on the hostname (including `/dropx`) stays behind `owner-only`.
-- **Claude** (Settings → Capabilities): *Code execution and file creation* on, *Allow network egress* on, and the vault hostname (`obsidian.deangoldsteen.com`) in *Additional allowed domains*.
+- **Cloudflare:** a separate Access application `obsidian-drop` with destination `obsidian.example.com/drop` and a single **Bypass / Everyone** policy. Path-specific apps take precedence over the hostname app, so everything else on the hostname (including `/dropx`) stays behind `owner-only`.
+- **Claude** (Settings → Capabilities): *Code execution and file creation* on, *Allow network egress* on, and the vault hostname (`obsidian.example.com`) in *Additional allowed domains*.
 
 Why not a GitHub relay: Claude's sandbox proxies github.com and api.github.com and refuses writes to any repo not attached to the chat, so a push-then-import design cannot work from there.
 
