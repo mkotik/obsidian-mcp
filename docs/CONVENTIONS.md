@@ -3,23 +3,29 @@
 How personal MCP servers are named, laid out, and deployed on the shared host.
 Read this before adding a new one.
 
-This repo holds **all** of them. The host, the tunnel, and the Cloudflare account
-are shared infrastructure; each MCP is a tenant on top of that.
+This repo is the Obsidian MCP server plus the deploy files for the shared host.
+The host, the tunnel, and the Cloudflare account are shared infrastructure; each
+MCP is a tenant on top of that. The iMessage tenant lives in its own repo
+(`imessage-server`).
 
 ---
 
 ## 1. Naming
 
-The rule: **shared things get generic names, tenants get their own name.** The
-original mistake was naming the box, the tunnel, and the repo after their first
-tenant (Obsidian), which stops making sense the moment there are two.
+The rule: **shared infrastructure gets generic names, tenants get their own
+name.** The host and the tunnel are shared, so they stay generic. Each tenant has
+its own repo, named after what it is. This repo was renamed from `personal-mcp`
+to `obsidian-mcp` on 2026-10-18, because it only contains the Obsidian server
+(plus the deploy files); the iMessage code is in `imessage-server`. The tunnel
+is still called `personal-mcp` and the auto-deploy instance is still
+`personal-mcp` (see Deployment).
 
 | Layer | Scope | Convention | Current |
 |---|---|---|---|
 | OCI instance | shared | `mcp-host` | `mcp-host` |
 | OS hostname | shared | `mcp-host` | `mcp-host` |
 | Cloudflare tunnel | shared | `personal-mcp` | `personal-mcp` |
-| Git repository | shared | `obsidian-mcp` | `obsidian-mcp` |
+| Git repository | per project | `<project>-mcp` | `obsidian-mcp` |
 | Public hostname | per service | `<service>.deangoldsteen.com` | `obsidian.` |
 | Access application | per service | `<service>-mcp` | `obsidian-mcp` |
 | systemd unit | per service | `<service>-mcp.service` | `obsidian-mcp.service` |
@@ -70,8 +76,9 @@ Every service binds to `127.0.0.1` on its own port. Nothing binds `0.0.0.0`.
 
 ## 2. Repository layout
 
-Today the repo holds a single service at the root. When the **second** service
-lands, move to:
+Today the repo holds a single service at the root. The iMessage tenant lives in
+its own repo (`imessage-server`), so the layout below only applies if services
+are ever merged into one repo. In that case, move to:
 
 ```
 obsidian-mcp/
@@ -255,6 +262,21 @@ the hardening, so a change to one is flagged in the log (`NOTE: … differs from
 the installed unit`) and installed by hand. Rollback restores code, not the
 database: an imessage commit that adds a migration is applied by
 `imessage-ingest` on start and stays applied.
+
+**Renamed repo, old instance name.** The auto-deploy instance is still called
+`personal-mcp` (so the timer is `auto-deploy@personal-mcp.timer` and the config is
+`/etc/auto-deploy/personal-mcp.conf`), even though the repo is now
+`obsidian-mcp`. The instance name is only a label. To change the repo URL, do
+both of these on the host:
+
+1. Edit `REMOTE=` in `/etc/auto-deploy/<name>.conf`. This file is a plain
+   root-owned **copy**; editing `deploy/auto-deploy/<name>.conf` in this repo does
+   not change it.
+2. Run `git remote set-url origin <new url>` in the checkout under
+   `/var/lib/deploy/src/<name>`. `REMOTE` is only used for the first clone; later
+   runs fetch from the checkout's own origin.
+
+Then run `sudo FORCE=1 /usr/local/sbin/auto-deploy <name>` and confirm it deploys.
 
 ```bash
 journalctl -u 'auto-deploy@*' -n 50 --no-pager      # what deployed, what failed
