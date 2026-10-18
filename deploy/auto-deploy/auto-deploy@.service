@@ -1,6 +1,6 @@
 [Unit]
 Description=Pull, build and deploy %i from GitHub (auto-rollback on failure)
-Documentation=https://github.com/mkotik/personal-mcp/blob/main/docs/CONVENTIONS.md
+Documentation=https://github.com/mkotik/obsidian-mcp/blob/main/docs/CONVENTIONS.md
 After=network-online.target
 Wants=network-online.target
 
